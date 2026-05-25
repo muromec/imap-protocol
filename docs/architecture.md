@@ -1,161 +1,179 @@
 # Architecture — imap-connector
 
-Current `connection.ts` is ~930 lines with collapsed concerns: socket I/O,
-IMAP command dispatch, and session state all share the same class.  This
-document describes a three-layer decomposition that separates those
-concerns without changing the public API.
+`imap-connector` is decomposed into four files with clear layer boundaries.
+The public API (`Connection`) is unchanged; the internals are split across
+Transport, CommandDispatcher, connection setup, and the session layer.
 
-Tests (`connection.test.ts`, 47 + 2 todo) pass against the public API and
-will continue to pass throughout the refactor.
+Tests: `connection.test.ts` — 47 passed, 2 todo (vitest, ~3s).
 
 ---
 
-## Layer 1 — Transport
+## Layer 1 — Transport (`transport.ts`, 210 lines)
 
-**File:** `transport.ts`
-
-**Responsibility:** turn a raw TCP stream into framed IMAP lines and back.
-This is the only layer that knows about `\r\n`, `{size}` literals, `+`
-continuations, and raw socket reads/writes.
+**Responsibility:** turn a raw TCP stream into framed IMAP lines/literals/
+continuations and back.  The only layer that knows about `\r\n`, `{size}`
+literals, `+` continuations, and raw socket reads/writes.  Has no knowledge
+of IMAP semantics — no tags, no OK/NO/BAD, no command meanings.
 
 ### State
 
-- `socket: Socket` — the underlying TCP/TLS socket.
-- `buf`, `literalRemaining`, `literalChunks` — line/literal framing buffer
-  (moved from `ImapReader`).
-- `debugEnabled: boolean` — toggled via `setDebug()`.
-- `dead: boolean` — true after socket close or error.
+- `socket: Socket` — the underlying TCP or TLS socket (already connected
+  when passed to the constructor).
+- `buf`, `literalRemaining`, `literalChunks` — line/literal framing buffer.
+- `dead: boolean` — set on socket close or error.
+- Callbacks: `onLine`, `onLiteral`, `onContinue`, `onClose`, `onError`,
+  `onRawRead` — single-slot each (setting replaces previous).
 
 ### Public interface
 
-```
-class Transport {
-  constructor(socket: Socket, debug?: boolean)
+| Method | Description |
+|---|---|
+| `constructor(socket, debug?)` | Wrap a connected socket.  Registers `data`, `close`, `error` handlers.  If debug is enabled, wraps `socket.write` for logging. |
+| `send(raw)` | Write bytes to the socket.  CRLF is appended automatically. |
+| `onLine(cb)` | Callback for each complete framed line (excluding `+` lines and literal data). |
+| `onLiteral(cb)` | Callback for each literal body (after `{size}` synchronisation). |
+| `onContinue(cb)` | Callback for `+` continuation lines. |
+| `onClose(cb)` | Socket closed. |
+| `onError(cb)` | Socket error (ECONNRESET is silently ignored as normal TCP teardown). |
+| `onRawRead(cb)` | Raw-read hook for debug logging. |
+| `close()` | Gracefully close the socket. |
+| `setDebug(enabled)` | Toggle debug logging at runtime. |
+| `dead` | Whether the socket has closed or errored. |
 
-  // Outbound
-  send(raw: string): void          // write raw bytes (no CRLF added)
+### Debug logging
 
-  // Inbound callbacks — each can be set once, replaces previous
-  onLine(cb: (line: string) => void): void
-  onLiteral(cb: (data: string) => void): void
-  onContinue(cb: (line: string) => void): void
-  onClose(cb: () => void): void
-  onError(cb: (err: Error) => void): void
-
-  // Raw-read hook for debug logging
-  onRawRead(cb: ((raw: string) => void) | null): void
-
-  // Lifecycle
-  close(): void
-  setDebug(enabled: boolean): void
-
-  // Query
-  get dead(): boolean
-}
-```
-
-### What it does NOT know about
-
-- Tags (A0001, A0002).
-- OK / NO / BAD status.
-- Any IMAP command or response meaning.
-- That `+ idling` means "entering IDLE".
-
-### Implementation notes
-
-- Extracted directly from `ImapReader` (lines 92–205) plus `debugSocket`
-  (lines 83–90) plus the socket lifecycle from `connect()` (lines 466–475,
-  the `onReady` socket setup) plus the `"close"` / `"error"` handlers
-  (lines 343–352, 423–443).
-- `onClose` and `onError` callbacks are set by the Command layer to
-  trigger `#failAllPending`.  Transport itself has no concept of pending
-  commands — it just signals that the socket is gone.
+When enabled, raw socket writes are logged with `→` and reads with `←`
+(both JSON-escaped).  Output goes to stderr with `[imap]` prefix and
+ISO timestamps.  Writes are intercepted via a `socket.write` monkey-patch;
+reads are logged from the `data` event handler.
 
 ---
 
-## Layer 2 — CommandDispatcher
+## Layer 2 — CommandDispatcher (`dispatch.ts`, 153 lines)
 
-**File:** `dispatch.ts`
+**Responsibility:** pair tagged IMAP commands with their tagged responses.
+Sends a command with a unique `A0001`-style tag, collects untagged lines
+that arrive before the matching tagged OK/NO/BAD, and resolves or rejects
+the per-command promise.  Also handles per-command timeouts.
 
-**Responsibility:** pair tagged commands with their responses.  Sends a
-command with a unique tag, collects untagged lines that arrive before the
-matching tagged OK/NO/BAD, and resolves (or rejects) the per-command
-promise.  Also handles per-command timeouts.
+Has no knowledge of IMAP semantics — does not know what LOGIN, SELECT,
+FETCH, or IDLE mean.
 
 ### State
 
-- `transport: Transport` — the transport to send on and receive lines from.
 - `#tag: number` — auto-incrementing tag counter.
 - `#pending: Map<tag, { resolve, reject, timer }>` — outstanding commands.
 - `#untagged: string[]` — lines accumulated since the current command
-  started (reset per command).
+  started (reset per `sendCommand` call).
+- `#dead: boolean` — set when the transport dies.
+- Callbacks: `onUntagged`, `onDead` — single-slot each.
 
 ### Public interface
 
+| Method | Description |
+|---|---|
+| `constructor(transport, defaultTimeout)` | Takes the Transport and wires `transport.onLine`, `transport.onClose`, `transport.onError`. |
+| `sendCommand(cmd)` | Send a tagged command.  Returns untagged lines that arrived before the tagged OK.  Rejects on tagged NO/BAD or timeout. |
+| `nextTag()` | Generate a fresh tag without sending anything.  Used by the Session's `idle()` which manages its own tag lifecycle. |
+| `onUntagged(cb)` | Callback for lines not consumed by a pending tagged command.  The Session layer uses this for mailbox updates, fetch parsing, and idle events. |
+| `onDead(cb)` | Called when the transport dies.  The Session layer uses this to clean up idle resolvers and fetch state. |
+| `dead` | Whether the transport has died. |
+
+### Line dispatch logic
+
 ```
-class CommandDispatcher {
-  constructor(transport: Transport, defaultTimeout: number)
+#onLine(line):
+  if line matches RE_TAGGED (A\d+ OK/NO/BAD):
+    if tag is in #pending → resolve/reject the command promise
+    else → forward to onUntagged callback (for idle DONE/OK detection)
+  else:
+    push to #untagged
+    forward to onUntagged callback
 
-  // Send a tagged command.  Returns untagged lines on OK.
-  sendCommand(cmd: string): Promise<string[]>
-
-  // Send a command that expects a + continuation before the tagged
-  // response.  Returns the continuation line.
-  sendCommandWithContinuation(cmd: string): Promise<string>
-
-  // Passthrough: lines the session layer should see that aren't
-  // consumed by a pending command (unsolicited untagged, idle events).
-  onUntagged(cb: (line: string) => void): void
-
-  // Called by Transport when the socket closes.  Rejects all pending
-  // promises and fires onDead.
-  onDead(cb: () => void): void
-
-  // Query
-  get dead(): boolean
-}
+#onTransportDead(err):
+  set #dead = true
+  reject all #pending promises
+  fire onDead callback
 ```
 
-### What it does NOT know about
-
-- LOGIN, SELECT, FETCH, IDLE semantics.
-- Mailbox state (EXISTS, RECENT, UIDVALIDITY).
-- Fetch result parsing.
-- Capabilities.
-
-### Implementation notes
-
-- `sendCommand` and `sendCommandWithContinuation` move from `Connection`
-  (lines 284–298 and 513–518).
-- `#dispatchLine` (lines 522–553) becomes `dispatcher._onLine`.  Tagged
-  responses are matched against `#pending`; untagged lines are forwarded
-  to the session via the `onUntagged` callback.
-- The `onDead` callback replaces the current pattern where `#failAllPending`
-  directly manipulates `#idleHook` / `#idleEventResolve` / `#idleDrainResolve`
-  — those belong in the Session layer.
-- Transport's `onClose` / `onError` handlers call `dispatcher._onTransportDead()`.
-- `CommandDispatcher.dead` mirrors `Transport.dead`.
+Unmatched tagged responses (e.g. the IDLE command's tagged OK after the
+DONE handshake) are forwarded to `onUntagged` so the Session layer can
+detect them via `#idleHook`.  This is the only IMAP-specific awareness in
+the dispatcher — all other tagged/untagged routing is generic.
 
 ---
 
-## Layer 3 — ImapSession (public API)
+## Layer 3 — Connection setup (`connect.ts`, 190 lines)
 
-**File:** `connection.ts` (renamed internal class, same public name)
+**Responsibility:** establish an authenticated IMAP connection.  Creates
+the socket, negotiates TLS/STARTTLS, authenticates with LOGIN, and fetches
+CAPABILITY.  Returns a fully-initialised Transport + CommandDispatcher +
+capabilities set.
 
-**Responsibility:** IMAP protocol semantics.  Uses `CommandDispatcher` to
-execute IMAP operations and interprets the responses.  This is the public
-`Connection` class.
+### Exported function
 
-### State (moved out of Connection)
+```ts
+async function connect(
+  config: ImapConfig,
+  debugEnabled: boolean,
+): Promise<{
+  transport: Transport;
+  dispatcher: CommandDispatcher;
+  capabilities: Set<string>;
+}>
+```
 
-- `#dispatcher: CommandDispatcher` — how it talks to the server.
-- `#mailboxInfo: MailboxInfo`
-- `capabilities: Set<string>`
-- `#fetchResolve`, `#fetchResults`, `#fetchPending`, `#fetchQueue`
-- `#idleHook`, `#idleEventResolve`, `#idleDrainResolve`
-- `#continuationResolve`
+### Internal flow (sequential async)
 
-### Public interface (unchanged)
+1. **`createSocket(config)`** — `tls.connect()` or `new Socket().connect()`
+   with `connTimeout`.  Returns a connected socket.
+
+2. **`waitForGreeting(dispatcher, config)`** — hooks into the dispatcher's
+   `onUntagged` callback.  Waits for the first `* OK` or `* PREAUTH` line.
+   Parses the greeting for `STARTTLS` capability.  Returns
+   `{ starttls: boolean }`.
+
+3. **`starttls(dispatcher, socket, transport, config)`** — sends the
+   STARTTLS command, upgrades the plain socket to TLS via
+   `tls.connect({ socket })`, returns a new Transport and CommandDispatcher
+   wrapping the upgraded socket.  Only called when `autotls` is set and
+   the server advertises STARTTLS.
+
+4. **`login(dispatcher, config)`** — sends `LOGIN` with `authTimeout`.
+   Rejects on timeout or tagged NO/BAD.
+
+5. **`fetchCapabilities(dispatcher, capabilities)`** — sends `CAPABILITY`,
+   parses the response, populates the `capabilities` set.  Best-effort:
+   resolves even if CAPABILITY fails.
+
+### How `Connection` uses it
+
+```ts
+async connect(): Promise<void> {
+    const { transport, dispatcher, capabilities } = await connect(
+      this.#config, this.#debugEnabled,
+    );
+    this.#transport = transport;
+    this.#dispatcher = dispatcher;
+    this.capabilities = capabilities;
+    this.#wireCallbacks();
+}
+```
+
+Nine lines.  `#wireCallbacks()` connects the transport and dispatcher to
+the Session's event handlers (fetch parsing, idle hooks, dead-connection
+cleanup).
+
+---
+
+## Layer 4 — Connection / Session (`connection.ts`, 628 lines)
+
+**Responsibility:** IMAP protocol semantics.  This is the public
+`Connection` class.  Uses `CommandDispatcher` to execute IMAP operations
+and interprets the responses.  Does not touch the socket directly — all
+I/O goes through the dispatcher and transport.
+
+### Public API (unchanged)
 
 ```
 class Connection {
@@ -171,99 +189,89 @@ class Connection {
   serverSupports(cap): boolean
   get dead(): boolean
   setDebug(enabled): void
-  sendCommand(cmd): Promise<string[]>       // kept for watcher
-  sendCommandWithContinuation(cmd): Promise<string>  // kept for idle
+  sendCommand(cmd): Promise<string[]>        // delegates to dispatcher
+  sendCommandWithContinuation(cmd): Promise<string>  // sets #continuationResolve
 }
 ```
 
-### What it does NOT know about
+### Internal structure (~628 lines)
 
-- Socket lifecycle, line framing, literal handling.
-- Tag counters, `#pending` map, per-command timeout timers.
+| Section | Lines | Content |
+|---|---|---|
+| State | 38–68 | `#transport`, `#dispatcher`, `#mailboxInfo`, `capabilities`, fetch state, idle state (`#idleHook`, `#idleEventResolve`, `#idleDrainResolve`), `#continuationResolve` |
+| Debug & lifecycle | 80–170 | `dead`, `setDebug`, `#wireCallbacks`, `serverSupports`, `sendCommand`, `sendCommandWithContinuation`, `#sessionUntagged` |
+| Connection setup | 152–172 | `connect()` (9 lines), `close()` (11 lines) |
+| Continuation dispatch | 180–186 | `#onContinue` — resolves `#continuationResolve` on `+` lines |
+| Untagged handlers | 188–260 | `#handleUntagged` (EXISTS/RECENT/FLAGS → `#mailboxInfo`), `#handleFetchLine` + `#onLiteral` + `#maybeFinishFetch` (fetch state machine) |
+| IMAP operations | 262–420 | `openBox`, `search`, `fetch`, `addFlags`, `fetchUnseen` |
+| IDLE | 422–570 | `idle()` async generator, `#parseIdleEvent` |
+| Search utilities | 575–628 | `escapeString`, `buildSearchQuery` |
 
-### Implementation notes
+### Dead-connection handling
 
-- `connect()` creates the transport and dispatcher internally, then runs
-  greeting → LOGIN → CAPABILITY → STARTTLS negotiation.
-- `close()` delegates to `dispatcher.sendCommand("LOGOUT")` then
-  `transport.close()`.  The dead-connection fast-path stays.
-- `idle()` still uses the async generator pattern, but its `finally` block
-  checks `dispatcher.dead` instead of `this.#idleHook != null`.  The socket
-  close path: Transport → CommandDispatcher.onDead → rejects pending →
-  Session's idle `#idleEventResolve(null)` → generator `finally` → sees
-  `dispatcher.dead` → skips DONE/drain.
-- The three `#idle*` fields stay in Session because they're session-level
-  state machines — the Command layer doesn't need to know about IDLE events
-  or drain phases.
+`#wireCallbacks()` sets `dispatcher.onDead()` to clean up session-level
+state when the transport dies:
 
----
+- Resolves `#idleEventResolve(null)` — breaks the idle `while` loop.
+- Resolves `#idleDrainResolve()` — unblocks the idle `finally` block if
+  the socket dies during the DONE/drain phase.
+- Nulls `#idleHook`.
+- Resolves any in-flight `#fetchResolve` with partial results.
 
-## Migration plan
+The `#idleDrainResolve` field is the last remaining cross-layer coupling:
+it is set during the idle DONE/drain phase and resolved by the socket-close
+path.  Removing it caused hangs when the server closed the socket during
+the drain `await` (see `idle-races.md` race #7).
 
-All steps keep `connection.test.ts` green.
+### IDLE flow
 
-### Step 1 — Extract Transport
+The `idle()` async generator is the most complex single method (~150 lines):
 
-- Create `transport.ts` with the `Transport` class.
-- Move `ImapReader` internals (lines 92–205), `debugSocket` (83–90), and
-  socket setup from `connect()` into `Transport`.
-- `Connection` creates a `Transport` instance; accesses `send()`, `onLine()`,
-  `onLiteral()`, `onContinue()`, `onRawRead()`, `close()` through it.
-- Remove `ImapReader` class from `connection.ts`.
-- Run tests — should pass identically.
-
-### Step 2 — Extract CommandDispatcher
-
-- Create `dispatch.ts` with the `CommandDispatcher` class.
-- Move `sendCommand`, `sendCommandWithContinuation`, `#dispatchLine`,
-  `#pending`, `#untagged`, `#tag`, `#failAllPending` (renamed to
-  `#onTransportDead`), and the `#dead` flag from `Connection` into
-  `CommandDispatcher`.
-- `CommandDispatcher` takes a `Transport` in its constructor and wires
-  `transport.onLine`, `transport.onClose`, `transport.onError`.
-- `Connection` creates a `CommandDispatcher` after creating the `Transport`.
-  It calls `dispatcher.sendCommand()` instead of `this.sendCommand()`.
-- The untagged-line passthrough (`onUntagged`) feeds session-level handlers
-  (`#handleUntagged`, `#handleFetchLine`, `#idleHook`).
-- Run tests — should pass identically.
-
-### Step 3 — Clean up Session
-
-- `Connection` no longer has `#reader`, `#dead`, `#pending`, `#untagged`,
-  `#tag`, `#failAllPending`, or `#dispatchLine`.
-- Public `sendCommand` and `sendCommandWithContinuation` delegate to
-  `#dispatcher`.
-- `dead` getter delegates to `#dispatcher.dead`.
-- The `idle()` generator's `finally` block uses `this.dead` /
-  `dispatcher.dead` instead of `this.#idleHook != null`.
-- Remove the `#idleDrainResolve` field — it was a cross-layer hack.  The
-  new flow: Transport close → CommandDispatcher.onDead → rejects all pending
-  AND resolves `#idleEventResolve(null)` via the session's callback.
-  The `finally` block sees `this.dead` and skips DONE/drain entirely.
-- Run tests — should pass identically.  May need to adjust a few test
-  expectations if behavior changes slightly.
+1. Generates a tag via `dispatcher.nextTag()`, sets an idle timeout timer.
+2. Installs `#idleHook` — intercepts all untagged lines and unmatched
+   tagged responses from the dispatcher's `onUntagged` callback.  Parses
+   EXISTS, RECENT, EXPUNGE, FETCH, and FLAGS events.
+3. Creates `firstEventPromise` BEFORE sending the IDLE command so that
+   events arriving synchronously with the `+ idling` continuation are
+   not dropped.
+4. Sends `IDLE` via `sendCommandWithContinuation`, awaits `+ idling`.
+5. Yields parsed events as they arrive.
+6. On `break` / `return()`: sets `done = true`, sends `DONE`, awaits the
+   tagged OK (or socket close via `#idleDrainResolve`), yields any
+   remaining queued events, cleans up.
 
 ---
 
-## Benefits
+## File listing
 
-1. **Debuggability.**  Socket close handling is in one place (Transport).
-   Command timeouts and tag matching are in one place (CommandDispatcher).
-   IMAP semantics are in one place (Session).  No more invisible coupling
-   through instance fields set by one layer and read by another.
+```
+vendored/imap-connector/
+├── transport.ts           210 lines   Layer 1 — socket + line/literal framing
+├── dispatch.ts            153 lines   Layer 2 — tagged command dispatch
+├── connect.ts             190 lines   Layer 3 — connection setup
+├── connection.ts          628 lines   Layer 4 — IMAP session (public API)
+├── mock.ts                285 lines   Mock IMAP server for tests
+├── index.ts                 9 lines   Barrel export
+├── interface.ts            55 lines   Shared types (ImapConfig, MailboxInfo, etc.)
+├── connection.test.ts     971 lines   47 tests + 2 todo
+├── test-integration.ts    113 lines   Integration test against real server
+└── docs/
+    ├── architecture.md                 this file
+    ├── design.md                      design decisions
+    ├── roadmap.md                     phased feature plan
+    ├── untested.md                    untested behaviours
+    └── idle-races.md                  IDLE race condition analysis
+```
 
-2. **Testability.**  Transport can be tested with raw line in/out, no IMAP
-   knowledge.  CommandDispatcher can be tested with a mock Transport that
-   replays lines.  Session can be tested with a mock CommandDispatcher.
+## Cross-layer coupling
 
-3. **Reuse.**  The Transport layer works for any line-based protocol with
-   literals (SMTP, POP3).  The CommandDispatcher works for any tagged-command
-   protocol.  Only the Session layer is IMAP-specific.
+One coupling remains: `#idleDrainResolve`.  Set during the idle DONE/drain
+phase, resolved by `#wireCallbacks`'s `onDead` handler when the socket
+closes.  This is necessary because the idle `finally` block `await`s a
+promise that waits for the tagged OK — if the socket dies during that
+`await`, the promise never resolves and the generator hangs.  The
+`#idleDrainResolve` provides an escape hatch.
 
-4. **State visibility.**  Each layer's fields are only accessed within that
-   layer.  No `#reader!.send(...)` assertions — the Session never touches
-   the socket.  No `#idleDrainResolve` — the socket close path doesn't
-   need to know about the IDLE drain state machine.
-
-5. **Smaller files.**  `transport.ts` ~150 lines, `dispatch.ts` ~130 lines,
-   `connection.ts` ~500 lines (down from ~930).
+All other coupling is through defined interfaces: Transport exposes
+callbacks, CommandDispatcher exposes `sendCommand`/`onUntagged`/`onDead`,
+the Session never touches the socket directly.
