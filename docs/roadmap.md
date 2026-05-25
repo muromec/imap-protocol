@@ -4,6 +4,20 @@ A phased plan to grow the module from a project-specific polling client into
 a general-purpose IMAP library while keeping the same principles: zero
 dependencies, promise-based API, no streaming parser unless necessary.
 
+## Status
+
+| Batch | Scope | Status | Tests |
+|---|---|---|---|
+| 1 | Test infrastructure + existing API | ✅ Complete | 25 + 1 todo |
+| 2 | Connection robustness | ✅ Complete | 33 + 2 todo |
+| 3a | IDLE prerequisites | ✅ Complete | 37 + 2 todo |
+| 3b | IDLE implementation | ✅ Complete | 43 + 2 todo |
+| 4 | Mailbox management | Not started | — |
+| 5 | Message mutation | Not started | — |
+| 6 | Richer fetch | Not started | — |
+| 7 | Advanced search and sort | Not started | — |
+| 8 | Gmail extensions | Not started | — |
+
 ## Guiding principles
 
 1. **Reject outdated servers.** If a required capability (e.g. `UIDPLUS`,
@@ -141,63 +155,44 @@ to the `idle()` implementation itself (Batch 3b).
 | Unsolicited FETCH during non-fetch is ignored | ✅ |
 | Socket error propagation (socket error test) | merged into close test |
 
-### Batch 3b — IDLE implementation (next)
+### Batch 3b — IDLE implementation ✅ COMPLETE
 
-### Design
+**Goal:** Real-time notification of new mail and mailbox changes.
 
-`IDLE` is modelled as an `AsyncIterator`:
+### Delivered
 
-```ts
-interface IdleEvent {
-  type: "exists" | "recent" | "expunge" | "fetch" | "flags";
-  seqno?: number;
-  count?: number;
-  uid?: number;
-  flags?: string[];
-}
+`idle()` method returning `AsyncIterable<IdleEvent>`:
 
-class Connection {
-  // Enter IDLE. Returns an async iterator of events.
-  // Call .return() on the iterator (or break out of the loop) to send DONE.
-  idle(): AsyncIterable<IdleEvent>;
+- Sends `IDLE`, waits for `+ idling` continuation via `sendCommandWithContinuation`.
+- Uses an `#idleHook` callback in `#dispatchLine` to intercept untagged lines
+  and parse them into `IdleEvent` objects (EXISTS, RECENT, EXPUNGE, FETCH
+  flags, FLAGS changes).
+- On `break` / `return()`: sends `DONE`, drains remaining untagged events
+  until the tagged OK arrives, then resolves.
+- Throws if the server lacks the `IDLE` capability.
+- Command timeout applies while waiting for the tagged OK.
 
-  // Convenience: idle + auto-reconnect on disconnect.
-  // Yields events until manually stopped.
-  watch(mailbox: string): AsyncIterable<IdleEvent>;
-}
-```
+The hook-based approach avoids overriding the private `#dispatchLine` method
+(which is not assignable in JavaScript).
 
-### Protocol flow
+Mock server (`mock.ts`) supports `+` continuations and `DONE` detection.
 
-1. Client sends `IDLE\r\n`.
-2. Server responds with `+ idling` (continuation).
-3. Server sends untagged responses as events occur: `* 5 EXISTS`, `* 2
-   EXPUNGE`, `* 4 FETCH (FLAGS (\Seen))`, etc.
-4. Client sends `DONE\r\n` to exit IDLE.
-5. Server sends tagged OK for the IDLE command.
+### Tests delivered (6 new, 43 total + 2 todo)
 
-The `idle()` method:
-- Sends `IDLE`, waits for `+`.
-- Yields parsed events from untagged responses.
-- On `return()` / `break`, sends `DONE`, waits for tagged OK, returns.
-- If the server doesn't support `IDLE` (checked via `serverSupports`),
-  throws.
+| Test | Status |
+|---|---|
+| `idle()` throws if server lacks IDLE capability | ✅ |
+| Yields EXISTS event | ✅ |
+| Yields EXPUNGE event | ✅ |
+| Yields FETCH flags-change event (UID, FLAGS parsed) | ✅ |
+| Yields RECENT event | ✅ |
+| Post-DONE drain: events after DONE before tagged OK are yielded | ✅ |
 
-The `watch()` method:
-- Opens the mailbox.
-- Enters `idle()`, yields events.
-- On any socket error or unexpected disconnect, reconnects, re-selects the
-  mailbox, re-enters idle.  Transparent to the caller.
+### Deferred
 
-### Tests
-
-- `idle()` yields EXISTS event when server sends `* N EXISTS`.
-- `idle()` yields EXPUNGE event.
-- `idle()` yields FETCH (flags change) event.
-- Breaking out of the `for await` loop sends DONE and resolves.
-- `idle()` throws if server lacks IDLE capability.
-- `watch()` reconnects and resumes after socket close.
-- `watch()` re-SELECTs the mailbox after reconnect.
+- **`watch()` method** (auto-reconnecting IDLE loop) is deferred.  It
+  requires socket-close-on-reconnect handling and a re-fetch-after-reconnect
+  strategy, both of which are non-trivial.  Tracked as a future batch item.
 
 ---
 

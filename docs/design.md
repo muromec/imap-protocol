@@ -98,31 +98,38 @@ The new module uses UIDs exclusively.  If you need "the last message", do
 `search(["ALL"])` and take the last UID.  This keeps the API surface small
 and avoids the footgun of confusing UIDs with sequence numbers.
 
-## Push events — IDLE support (Batch 3, in progress)
+## Push events — IDLE support ✅ (Batch 3)
 
-IDLE is the single most impactful missing feature: it enables real-time
-notification of new mail without polling.  A detailed race-condition analysis
-lives in `docs/idle-races.md`.
+IDLE enables real-time notification of new mail without polling.  The full
+implementation was delivered across two sub-batches:
 
-**Batch 3a (prerequisites) is complete** — four of five blockers are done:
+**Batch 3a (prerequisites)** addressed four blockers identified in the
+race-condition analysis (`docs/idle-races.md`):
 
 1. ✅ **`+` continuation handling** — `ImapReader` detects `+` lines and
    routes them to `onContinue`.  `Connection` exposes
    `sendCommandWithContinuation()` for IDLE/APPEND.
 2. ✅ **Socket error propagation** — `#failAllPending()` rejects all
-   outstanding promises on socket `"close"` or `"error"`.  The mock server
-   destroys the socket on unexpected commands rather than throwing.
+   outstanding promises on socket `"close"` or `"error"`.
 3. ✅ **`fetch()` concurrency guard** — `fetch()` throws if another fetch
    is already in-flight.
 4. ✅ **`#onLiteral` / `#handleFetchLine` safety** — `#handleFetchLine`
-   returns early when no `#fetchResolve` is set, preventing unsolicited
-   FETCH responses from leaking into fetch state.
-5. **Post-DONE drain** — deferred to the `idle()` implementation itself:
-   the iterator will continue yielding events after `DONE` is sent until
-   the tagged OK arrives.
+   returns early when no `#fetchResolve` is set.
 
-The `idle()` method will return an `AsyncIterator<IdleEvent>` as described
-in the roadmap.
+**Batch 3b (IDLE implementation)** delivered the `idle()` method:
+
+- Returns `AsyncIterable<IdleEvent>`.
+- Sends `IDLE`, waits for `+ idling` continuation, then yields parsed
+  events (EXISTS, RECENT, EXPUNGE, FETCH flags, FLAGS changes) as they
+  arrive from the server.
+- On `break` / `return()`: sends `DONE`, drains remaining untagged events
+  until the tagged OK arrives, then resolves.
+- Throws if the server lacks the `IDLE` capability.
+- Uses an `#idleHook` callback in `#dispatchLine` rather than overriding
+  the private method (which is not assignable in JavaScript).
+
+The `watch()` convenience method (auto-reconnecting IDLE loop) is deferred
+to a future batch.
 
 ## CAPABILITY negotiation
 
@@ -201,20 +208,20 @@ vendored/imap-connector/
 ├── index.ts                barrel re-export
 ├── connection.ts           ImapReader (line/literal framing) + Connection (async API)
 ├── mock.ts                 scenario-based mock IMAP server
-├── connection.test.ts      37 unit tests + 2 todo (vitest, ~2.3s)
+├── connection.test.ts      43 unit tests + 2 todo (vitest, ~2.5s)
 ├── test-integration.ts     integration test against real server
 └── docs/
     ├── design.md           this file
     ├── roadmap.md          phased feature plan (batches 1-8)
     ├── untested.md         catalogue of untested behaviours with risk assessments
-    └── idle-races.md       race condition analysis for IDLE (prerequisites done)
+    ├── idle-races.md       race condition analysis for IDLE
 ```
 
 ## What the module is not
 
 - **Not a general-purpose IMAP client.**  It does mailbox polling, not
   message composition.  It does UID-based operations, not sequence numbers.
-  Push support (IDLE) is planned but not yet implemented.
+  Push support (IDLE) is implemented as an `AsyncIterable<IdleEvent>`.
 
 - **Not a replacement for `imap-module`'s full API.**  It covers the ~15% of
   the API that the project uses (polling + robustness).  The remaining 85%
