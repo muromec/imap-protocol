@@ -934,4 +934,33 @@ describe("idle", () => {
     // Should not throw or hang — returns immediately.
     await conn.close();
   });
+
+  it("does not hang when socket closes during DONE/drain phase", async () => {
+    // The keepalive timer in the watcher triggers return() on the idle
+    // iterator, which sends DONE and then waits for the tagged OK.  If
+    // the socket closes while waiting for that OK, the drain promise
+    // must resolve (via #idleDrainResolve) so the generator exits
+    // instead of hanging forever.
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ IDLE$/,
+        respond: "+ idling",
+      },
+    ]);
+
+    // Start idle, let it settle, then trigger return() and immediately
+    // close the socket before the tagged OK arrives.
+    const iterator = conn.idle()[Symbol.asyncIterator]();
+    await iterator.next(); // enters IDLE, gets + idling
+
+    const returnPromise = (iterator as any)["return"]?.();
+    // Give the DONE command a tick to be sent, then kill the socket.
+    await new Promise((r) => setTimeout(r, 10));
+    server.close();
+
+    // Should resolve quickly, not hang.
+    await returnPromise;
+    server.close();
+  });
 });

@@ -242,6 +242,10 @@ export class Connection {
   // idle event resolver — set during idle() to break the loop on socket close.
   #idleEventResolve: ((ev: IdleEvent | null) => void) | null = null;
 
+  // drain resolver — set during idle() DONE phase; resolved on socket close
+  // so the finally block doesn't hang if the socket dies mid-drain.
+  #idleDrainResolve: (() => void) | null = null;
+
   /**
    * Enable or disable protocol-level debug logging at runtime.
    * When enabled, raw socket reads/writes and line dispatch are
@@ -344,6 +348,10 @@ export class Connection {
               this.#idleEventResolve(null);
               this.#idleEventResolve = null;
             }
+            if (this.#idleDrainResolve) {
+              this.#idleDrainResolve();
+              this.#idleDrainResolve = null;
+            }
             this.#failAllPending(new Error("Socket closed"));
         });
         socket.on("error", (e: Error) => {
@@ -420,12 +428,20 @@ export class Connection {
                   this.#idleEventResolve(null);
                   this.#idleEventResolve = null;
                 }
+                if (this.#idleDrainResolve) {
+                  this.#idleDrainResolve();
+                  this.#idleDrainResolve = null;
+                }
                 this.#failAllPending(new Error("Socket closed"));
               });
               tlsSocket.on("error", (e: Error) => {
                 if (this.#idleEventResolve) {
                   this.#idleEventResolve(null);
                   this.#idleEventResolve = null;
+                }
+                if (this.#idleDrainResolve) {
+                  this.#idleDrainResolve();
+                  this.#idleDrainResolve = null;
                 }
                 this.#failAllPending(e);
               });
@@ -837,6 +853,7 @@ export class Connection {
         // Drain: wait for tagged OK for IDLE
         await new Promise<void>((resolve) => {
           drainResolve = resolve;
+          this.#idleDrainResolve = resolve;
         });
 
         // Yield any events that arrived after DONE but before tagged OK.
@@ -848,6 +865,7 @@ export class Connection {
       // Clean up idle state.
       this.#idleHook = null;
       this.#idleEventResolve = null;
+      this.#idleDrainResolve = null;
     }
   }
 
