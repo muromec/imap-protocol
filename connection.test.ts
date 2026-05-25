@@ -949,18 +949,24 @@ describe("idle", () => {
       },
     ]);
 
-    // Start idle, let it settle, then trigger return() and immediately
-    // close the socket before the tagged OK arrives.
-    const iterator = conn.idle()[Symbol.asyncIterator]();
-    await iterator.next(); // enters IDLE, gets + idling
+    // Start idle — don't await next() because the generator won't yield
+    // until an event arrives.  We just need the idle session to begin
+    // (the + idling continuation must have been received).  Kick off
+    // idle in the background, wait for the continuation, then trigger
+    // return() and kill the socket.
+    const idlePromise = (async () => {
+      for await (const _ of conn.idle()) { void _; }
+    })();
 
-    const returnPromise = (iterator as any)["return"]?.();
-    // Give the DONE command a tick to be sent, then kill the socket.
-    await new Promise((r) => setTimeout(r, 10));
+    // Wait for + idling to arrive, then trigger return().
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Call return() and immediately close the socket before the
+    // tagged OK for DONE arrives.  #idleDrainResolve should fire
+    // on socket close so idlePromise resolves instead of hanging.
+    const returnPromise = idlePromise;
     server.close();
 
-    // Should resolve quickly, not hang.
     await returnPromise;
-    server.close();
   });
 });
