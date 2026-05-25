@@ -19,15 +19,47 @@ API and never see an event emitter or a raw stream.
 ## Zero dependencies
 
 `imap-connector` has **no runtime dependencies**.  It speaks IMAP directly
-over a `node:tls` socket.  This means:
+over a `node:tls` socket (or a plain `node:net` socket when `tls: false`
+is set — primarily used by the mock server in tests).  This means:
 
 - No dependency on `imap-module` or any other IMAP library.
 - No dependency on a streaming MIME parser — we return the raw RFC822 body
   and let the caller decide how to parse it (the project already uses
   `postal-mime` for that).
-- The only external API surface is `node:tls`.
+- The only external APIs are `node:tls` and `node:net`.
 
-## Why a custom line/literal reader instead of a full IMAP parser
+## Test infrastructure — MockImapServer
+
+Every public method and protocol edge case is covered by unit tests that
+run against a mock IMAP server (`mock.ts`) — no real network required.
+The full suite runs in under 1 second.
+
+### Design
+
+`MockImapServer` binds to a random local port, accepts a connection, sends
+a greeting, then replays a pre-configured **scenario** of expected commands
+and canned responses.
+
+```ts
+server.scenario([
+  { expect: /^A\d+ LOGIN /,         respond: "A0001 OK logged in" },
+  { expect: /^A\d+ SELECT "INBOX"/, respond: ["* 3 EXISTS", "* 1 RECENT"] },
+]);
+```
+
+Each step either matches the command (prompting a response) or, when
+`allowExtra` is set, sends a dummy `OK` so the client doesn't hang.
+Tagged `OK` completions are auto-appended to every step that doesn't
+already include one.  Literals (`{size}`) are handled by sending the
+data bytes raw followed by `\r\n`.
+
+### Test isolation
+
+Each test creates a fresh `MockImapServer` instance via a factory
+function.  The factory registers the server in a cleanup list; `afterAll`
+closes all of them.  No shared state between tests, so the suite runs
+concurrently without locks.
+
 
 `vendored/imap/Parser.js` is ~1000 lines of streaming parser that
 tokenizes IMAP responses into structured objects (fetch attributes, envelope
@@ -110,14 +142,28 @@ The old `FetchOptions` supported `struct`, `envelope`, `size`, `modifiers`,
 project only ever requests `BODY.PEEK[]` (the full RFC822 message).
 `flags` are parsed from the FETCH response directly via regex.
 
-## Search criteria: flat string builder
+## Search criteria: nested-array API
 
 The old module had a full search query builder (`buildSearchQuery`) that
 handled nested `OR` groups, charset detection for UTF-8 strings, and literal
-encoding for non-ASCII characters.  Our `buildSearchQuery` is a simplified
-version that handles the criteria the project uses (`UNSEEN`, `ALL`) plus a
-few common ones.  It does not do charset detection or nested OR — those can
-be added when needed.
+encoding for non-ASCII characters.  Our `buildSearchQuery` handles the
+criteria the project uses (`UNSEEN`, `ALL`) plus string, numeric, and UID
+criteria via a **nested-array format**:
+
+```ts
+// bare keyword
+conn.search(["UNSEEN"])
+
+// keyword with argument
+conn.search([["FROM", "alice@example.com"], "UNSEEN"])
+
+// two-argument form (HEADER)
+conn.search([["HEADER", "X-Custom", "yes"]])
+```
+
+Flat arrays like `["FROM", "alice@example.com", "UNSEEN"]` are not
+supported — callers must wrap criteria-with-arguments in their own array.
+Charset detection and nested `OR` groups can be added when needed.
 
 ## Error handling philosophy
 
@@ -132,18 +178,38 @@ be added when needed.
   matches the old `node-imap` behaviour where non-existent UIDs silently
   produce no results.
 
+## Module structure
+
+```
+vendored/imap-connector/
+├── package.json            workspace package, no runtime deps
+├── index.ts                barrel re-export
+├── connection.ts           ImapReader (line/literal framing) + Connection (async API)
+├── mock.ts                 scenario-based mock IMAP server
+├── connection.test.ts      25 unit tests + 1 todo (vitest)
+├── test-integration.ts     integration test against real server
+└── docs/
+    ├── design.md           this file
+    └── roadmap.md          phased feature plan (batches 1-8)
+```
+
 ## What the module is not
 
-- **Not a general-purpose IMAP client.**  It does mailbox management, not
+- **Not a general-purpose IMAP client.**  It does mailbox polling, not
   message composition.  It does UID-based operations, not sequence numbers.
   It polls, it doesn't push.
 
 - **Not a replacement for `imap-module`'s full API.**  It covers the ~10% of
   the API that the project actually uses.  The remaining 90% (mailbox CRUD,
   COPY/MOVE, APPEND, IDLE, SORT, THREAD, quota, Gmail extensions, etc.) is
-  deliberately omitted.
+  deliberately omitted and tracked in the roadmap.
 
 - **Not a streaming parser.**  `BODY.PEEK[]` returns the entire message as a
   single string.  For large messages with attachments, this could be
   memory-intensive.  A streaming fetch could be added via an
   `AsyncIterator<Buffer>` return type if needed.
+
+- **Not a multi-body-part fetch parser.**  The current regex-based fetch
+  handler only processes the first `BODY[...]` literal on each `* N FETCH`
+  line.  Responses with multiple body parts on continuation lines require a
+  proper FETCH response parser (tracked as a `todo` test).

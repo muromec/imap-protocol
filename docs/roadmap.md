@@ -16,58 +16,45 @@ dependencies, promise-based API, no streaming parser unless necessary.
 
 ---
 
-## Batch 1 — test infrastructure
+## Batch 1 — test infrastructure ✅ COMPLETE
 
 **Goal:** A mock IMAP server that speaks enough protocol to test the existing
 module without a real mailbox.
 
-### Mock server design
+### Delivered
 
-A `MockImapServer` class that:
-- Binds to a random local port (no TLS, or self-signed cert).
-- Accepts one connection, then sends `* OK mock ready`.
-- Reads lines, matches tagged commands via regex, responds with pre-
-  configured canned responses.
-- Supports literal `{size}` in both directions (client → server for APPEND,
-  server → client for FETCH bodies).
-- Exposes a `scenario` API:
+`MockImapServer` (`mock.ts`) — binds to a random local port, accepts
+connections, sends a greeting, then replays a pre-configured **scenario** of
+expected commands and canned responses.  Key features:
+
+- Regex-based command matching with auto-tagged `OK` completion.
+- Literal `{size}` handling — raw data sent without extra `\r\n` framing.
+- `allowExtra` mode for cleanup commands (LOGOUT, etc.) after scenario ends.
+- Per-test isolation via a factory + `afterAll` cleanup list.
+
+Sample use:
 
 ```ts
 server.scenario([
-  { expect: /^A\d+ LOGIN /,    respond: "A0001 OK logged in" },
-  { expect: /^A\d+ SELECT /,   respond: ["* 3 EXISTS", "* 1 RECENT", "* FLAGS (\\Seen \\Answered)", "* OK [UNSEEN 1]", "A0002 OK done"] },
-  { expect: /^A\d+ UID SEARCH UNSEEN/, respond: "* SEARCH 42" },
-  { expect: /^A\d+ UID FETCH .*BODY/,  respond: [
-    "* 1 FETCH (UID 42 FLAGS (\\Seen) BODY[] {14}",
-    "Hello, world!\r\n",
-    "A0004 OK done",
-  ] },
+  { expect: /^A\d+ LOGIN /,         respond: "A0001 OK logged in" },
+  { expect: /^A\d+ SELECT "INBOX"/, respond: ["* 3 EXISTS", "* 1 RECENT"] },
 ]);
 ```
 
-- `respond` can be a string (single line), an array of strings (multiple
-  lines with CRLF delimiters), or a function that receives the matched
-  command and returns a response dynamically.
-- Tracks whether all expected commands were received.  Throws on unexpected
-  commands unless `{ allowExtra: true }` is set.
-- `close()` shuts down the listener.
+### Tests delivered (connection.test.ts)
 
-### Tests for existing functionality
+25 passing + 1 `todo`:
 
-- `connect()` — server sends greeting, client sends LOGIN, resolves.
-- `connect()` — server sends `* BYE` before greeting, rejects.
-- `connect()` — server sends tagged `NO` to LOGIN, rejects.
-- `openBox("INBOX")` — parses EXISTS, RECENT, FLAGS, UNSEEN, UIDVALIDITY,
-  UIDNEXT from untagged responses.
-- `search(["UNSEEN"])` — returns UIDs from `* SEARCH` line.
-- `search(["ALL"])` — empty result.
-- `fetch([42])` — single message, literal body.
-- `fetch([42, 43])` — two messages, both with literal bodies, verifies
-  correct pairing of seqno/uid/flags.
-- `fetch([])` — resolves to `[]` immediately.
-- `addFlags([42], "\\Seen")` — sends `UID STORE 42 +FLAGS.SILENT (\Seen)`.
-- `fetchUnseen()` — chains search + fetch.
-- `close()` — sends LOGOUT, closes socket.
+| Group | Tests |
+|---|---|
+| `connect` | greeting + LOGIN, LOGIN NO rejection, LOGIN BAD rejection |
+| `openBox` | SELECT parsing (EXISTS, RECENT, FLAGS, UIDVALIDITY, UIDNEXT, UNSEEN), EXAMINE flag, UNSEEN from OK code |
+| `search` | UNSEEN results, empty SEARCH, nested FROM/HEADER/UID criteria, LARGER |
+| `fetch` | single message, multiple messages (seqno/uid/flags pairing), empty input, custom body part (HEADER), empty flags |
+| `fetch` (todo) | multi-body-part fetch on continuation lines |
+| `addFlags` | single flag, missing backslash prefix, flag array, tagged NO rejection |
+| `fetchUnseen` | search UNSEEN + fetch chain, empty when no unseen |
+| `close` | LOGOUT sent, LOGOUT failure handled gracefully |
 
 ---
 
