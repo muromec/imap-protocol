@@ -80,13 +80,12 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
  * Lines starting with `+` are IMAP continuations and are routed to
  * `onContinue` rather than `onLine`.
  */
-function debugSocket(socket: Socket, prefix: string, onWrite: (raw: string) => void, onRead: (raw: string) => void): Socket {
+function debugSocket(socket: Socket, prefix: string, onWrite: (raw: string) => void): Socket {
   const origWrite = socket.write.bind(socket);
   socket.write = function (data: string | Buffer, ...rest: any[]) {
     onWrite(typeof data === "string" ? data : data.toString("utf8"));
     return origWrite(data, ...rest);
   } as typeof socket.write;
-  // We can't hook raw reads from here — that's done in ImapReader.
   return socket;
 }
 
@@ -330,7 +329,7 @@ export class Connection {
         clearTimeout(connTimer);
         // Debug: wrap socket writes and raw reads.
         if (this.#debugEnabled) {
-          debugSocket(socket, "", (raw) => this.#debug("→", raw), () => {});
+          debugSocket(socket, "", (raw) => this.#debug("→", raw));
         }
         this.#reader = new ImapReader(socket);
         this.#reader.onLine((line) => this.#dispatchLine(line));
@@ -347,7 +346,7 @@ export class Connection {
             }
             this.#failAllPending(new Error("Socket closed"));
         });
-        socket.on("error", (e) => {
+        socket.on("error", (e: Error) => {
           this.#failAllPending(e);
         });
 
@@ -423,7 +422,7 @@ export class Connection {
                 }
                 this.#failAllPending(new Error("Socket closed"));
               });
-              tlsSocket.on("error", (e) => {
+              tlsSocket.on("error", (e: Error) => {
                 if (this.#idleEventResolve) {
                   this.#idleEventResolve(null);
                   this.#idleEventResolve = null;
@@ -456,7 +455,7 @@ export class Connection {
       }
 
       socket.once("connect", () => onReady(socket));
-      socket.once("error", (e) => settle(() => reject(e)));
+      socket.once("error", (e: Error) => settle(() => reject(e)));
     });
   }
 
@@ -831,7 +830,7 @@ export class Connection {
 
       // If the socket is already closed, skip DONE/drain — there's
       // nothing to send to and the tagged OK will never arrive.
-      if (this.#idleHook) {
+      if (this.#idleHook != null) {
         // Send DONE
         this.#reader!.send("DONE");
 
