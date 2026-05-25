@@ -1,6 +1,6 @@
 import tls from "node:tls";
 import { Socket } from "node:net";
-import type { ImapConfig } from "./connection.ts";
+import type { ImapConfig } from "./interface.ts";
 import { Transport } from "./transport.ts";
 import { CommandDispatcher } from "./dispatch.ts";
 
