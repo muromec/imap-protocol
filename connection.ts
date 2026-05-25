@@ -1,4 +1,5 @@
 import tls from "node:tls";
+import { Socket } from "node:net";
 
 // ── types ──────────────────────────────────────────────────────────────────
 
@@ -179,30 +180,39 @@ export class Connection {
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const socket = tls.connect(
-        { host: this.#config.host, port: this.#config.port },
-        () => {
-          this.#reader = new ImapReader(socket);
+      const onConnect = (socket: Socket) => {
+        this.#reader = new ImapReader(socket);
 
-          this.#reader.onLine((line) => this.#dispatchLine(line));
-          this.#reader.onLiteral((data) => this.#onLiteral(data));
+        this.#reader.onLine((line) => this.#dispatchLine(line));
+        this.#reader.onLiteral((data) => this.#onLiteral(data));
 
-          // Wait for greeting then LOGIN
-          const onGreeting = (line: string) => {
-            if (line.startsWith("* OK") || line.startsWith("* PREAUTH")) {
-              // remove this ad-hoc listener — greeting handled
-              this.#reader!.onLine((l) => this.#dispatchLine(l));
-              this.sendCommand(
-                `LOGIN "${this.#config.user}" "${this.#config.password}"`,
-              )
-                .then(() => resolve())
-                .catch(reject);
-            }
-          };
-          // override temporarily for greeting
-          this.#reader.onLine(onGreeting);
-        },
-      );
+        // Wait for greeting then LOGIN
+        const onGreeting = (line: string) => {
+          if (line.startsWith("* OK") || line.startsWith("* PREAUTH")) {
+            // remove this ad-hoc listener — greeting handled
+            this.#reader!.onLine((l) => this.#dispatchLine(l));
+            this.sendCommand(
+              `LOGIN "${this.#config.user}" "${this.#config.password}"`,
+            )
+              .then(() => resolve())
+              .catch(reject);
+          }
+        };
+        // override temporarily for greeting
+        this.#reader.onLine(onGreeting);
+      };
+
+      let socket: Socket;
+      if (this.#config.tls) {
+        socket = tls.connect(
+          { host: this.#config.host, port: this.#config.port },
+        );
+      } else {
+        socket = new Socket();
+        socket.connect(this.#config.port, this.#config.host);
+      }
+
+      socket.once("connect", () => onConnect(socket));
       socket.once("error", reject);
     });
   }
@@ -210,6 +220,8 @@ export class Connection {
   async close(): Promise<void> {
     try {
       await this.sendCommand("LOGOUT");
+    } catch {
+      // LOGOUT may fail; close the socket regardless.
     } finally {
       this.#reader?.close();
     }
