@@ -1,4 +1,3 @@
-import tls from "node:tls";
 import { Socket } from "node:net";
 
 const CRLF = "\r\n";

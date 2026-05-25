@@ -1,7 +1,7 @@
-import tls from "node:tls";
-import { Socket } from "node:net";
+import { type ConnectionOptions as TlsConnectionOptions } from 'tls';
 import { Transport } from "./transport.ts";
 import { CommandDispatcher } from "./dispatch.ts";
+import { connect } from "./connect.ts";
 
 // ── types ──────────────────────────────────────────────────────────────────
 
@@ -13,7 +13,7 @@ export interface ImapConfig {
   /** Use implicit TLS (port 993). Default true. Set false for plain TCP. */
   tls?: boolean;
   /** TLS options passed to tls.connect(). */
-  tlsOptions?: tls.ConnectionOptions;
+  tlsOptions?: TlsConnectionOptions;
   /**
    * STARTTLS upgrade strategy.
    * - "always": attempt STARTTLS if server supports it
@@ -82,22 +82,22 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
  * Lines starting with `+` are IMAP continuations and are routed to
  * `onContinue` rather than `onLine`.
  */
-// ── connection ──────────────────────────────────────────────────────────────
+ // ── connection ──────────────────────────────────────────────────────────────
 
-export class Connection {
-  #config: ImapConfig;
-  #transport: Transport | null = null;
-  #dispatcher: CommandDispatcher | null = null;
-  #debugEnabled: boolean;
+ export class Connection {
+   #config: ImapConfig;
+   #transport: Transport | null = null;
+   #dispatcher: CommandDispatcher | null = null;
+   #debugEnabled: boolean;
 
-  constructor(config: ImapConfig) {
-    this.#config = config;
-    this.#debugEnabled = config.debug ?? false;
-  }
-  #mailboxInfo: MailboxInfo | null = null;
+   constructor(config: ImapConfig) {
+     this.#config = config;
+     this.#debugEnabled = config.debug ?? false;
+   }
+   #mailboxInfo: MailboxInfo | null = null;
 
-  /** Server capabilities discovered after LOGIN. */
-  readonly capabilities = new Set<string>();
+   /** Server capabilities discovered after LOGIN. */
+   capabilities = new Set<string>();
 
   // fetch state
   #fetchResolve: ((msgs: FetchedMessage[]) => void) | null = null;
@@ -140,6 +140,32 @@ export class Connection {
     }
   }
 
+  #wireCallbacks(): void {
+    this.#transport!.onLiteral((data) => this.#onLiteral(data));
+    this.#transport!.onContinue((line) => this.#onContinue(line));
+    this.#transport!.onRawRead((raw) => {
+      if (this.#debugEnabled) this.#debug("←", JSON.stringify(raw));
+    });
+    this.#dispatcher!.onUntagged((line) => this.#sessionUntagged(line));
+    this.#dispatcher!.onDead(() => {
+      if (this.#idleEventResolve) {
+        this.#idleEventResolve(null);
+        this.#idleEventResolve = null;
+      }
+      if (this.#idleDrainResolve) {
+        this.#idleDrainResolve();
+        this.#idleDrainResolve = null;
+      }
+      this.#idleHook = null;
+      if (this.#fetchResolve) {
+        const r = this.#fetchResolve;
+        this.#fetchResolve = null;
+        this.#fetchQueue = null;
+        r(this.#fetchResults);
+      }
+    });
+  }
+
   /**
    * Check whether the server advertises a given capability.
    * Capability names are compared case-insensitively.
@@ -173,170 +199,19 @@ export class Connection {
     this.#handleFetchLine(line);
   }
 
-  // ── dispatcher wiring ─────────────────────────────────────────────────
 
-  #wireDispatcher(): void {
-    this.#dispatcher = new CommandDispatcher(
-      this.#transport!,
-      this.#config.commandTimeout ?? 30_000,
-    );
-
-    // Route untagged lines through the session handler.
-    this.#dispatcher.onUntagged((line) => {
-      this.#sessionUntagged(line);
-    });
-
-    // Transport death → cleanup session-level state.
-    this.#dispatcher.onDead(() => {
-      if (this.#idleEventResolve) {
-        this.#idleEventResolve(null);
-        this.#idleEventResolve = null;
-      }
-      if (this.#idleDrainResolve) {
-        this.#idleDrainResolve();
-        this.#idleDrainResolve = null;
-      }
-      this.#idleHook = null;
-      if (this.#fetchResolve) {
-        const r = this.#fetchResolve;
-        this.#fetchResolve = null;
-        this.#fetchQueue = null;
-        r(this.#fetchResults);
-      }
-    });
-  }
 
   // ── connect / close ────────────────────────────────────────────────────
 
-  connect(): Promise<void> {
-    const tlsEnabled = this.#config.tls !== false;
-    const connTimeout = this.#config.connTimeout ?? 30_000;
-    const authTimeout = this.#config.authTimeout ?? 10_000;
-
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const settle = (fn: () => void) => {
-        if (!settled) { settled = true; fn(); }
-      };
-
-      // connection timeout
-      const connTimer = setTimeout(() => {
-        settle(() => reject(new Error("Connection timed out")));
-      }, connTimeout);
-
-      const onReady = (socket: Socket) => {
-        clearTimeout(connTimer);
-        this.#transport = new Transport(socket, this.#debugEnabled);
-        this.#transport.onLiteral((data) => this.#onLiteral(data));
-        this.#transport.onContinue((line) => this.#onContinue(line));
-        this.#transport.onRawRead((raw) => { if (this.#debugEnabled) this.#debug("←", JSON.stringify(raw)); });
-        this.#wireDispatcher();
-
-        let starttlsDone = false;
-
-        const doLogin = () => {
-          // auth timeout
-          const authTimer = setTimeout(() => {
-            settle(() => reject(new Error("Authentication timed out")));
-          }, authTimeout);
-
-          this.sendCommand(
-            `LOGIN "${this.#config.user}" "${this.#config.password}"`,
-          )
-            .then(() => {
-              clearTimeout(authTimer);
-              // CAPABILITY detection
-              this.sendCommand("CAPABILITY").then((lines) => {
-                for (const line of lines) {
-                  const m = line.match(/^\* CAPABILITY (.*)/i);
-                  if (m) {
-                    for (const cap of m[1].split(/\s+/)) {
-                      this.capabilities.add(cap.toUpperCase());
-                    }
-                  }
-                }
-                settle(() => resolve());
-              }).catch(() => {
-                // best-effort: resolve even if CAPABILITY fails
-                settle(() => resolve());
-              });
-            })
-            .catch((e) => settle(() => reject(e)));
-        };
-
-        let greeted = false;
-
-        const onGreeting = (line: string) => {
-          if (greeted) return;
-          if (!line.startsWith("* OK") && !line.startsWith("* PREAUTH")) return;
-          greeted = true;
-
-          // check for STARTTLS in greeting capabilities
-          const greetCaps = line.match(/CAPABILITY (.*)/i);
-          const hasStarttls = greetCaps
-            ? greetCaps[1].split(/\s+/).some((c) => c.toUpperCase() === "STARTTLS")
-            : false;
-
-          const wantStarttls = this.#config.autotls === "always" || this.#config.autotls === "required";
-          const canStarttls = !tlsEnabled && hasStarttls;
-
-          if (wantStarttls && !canStarttls && this.#config.autotls === "required") {
-            settle(() => reject(new Error("STARTTLS required but not available")));
-            return;
-          }
-
-          if (canStarttls && wantStarttls && !starttlsDone) {
-            starttlsDone = true;
-            this.#dispatcher = null;
-            this.sendCommand("STARTTLS").then(() => {
-              const rawSocket = socket;
-              const tlsSocket = tls.connect({
-                socket: rawSocket,
-                host: this.#config.host,
-                ...this.#config.tlsOptions,
-              });
-              this.#transport = new Transport(tlsSocket, this.#debugEnabled);
-              this.#transport.onLiteral((data) => this.#onLiteral(data));
-              this.#transport.onContinue((line) => this.#onContinue(line));
-              this.#transport.onRawRead((raw) => { if (this.#debugEnabled) this.#debug("←", JSON.stringify(raw)); });
-              this.#wireDispatcher();
-              doLogin();
-            }).catch((e) => settle(() => reject(e)));
-            return;
-          }
-
-          // no STARTTLS — proceed to login
-          doLogin();
-        };
-
-        // Use the dispatcher's untagged callback to detect the greeting.
-        // The dispatcher owns transport.onLine, so we route through
-        // the session-level handler temporarily.
-        const untaggedHandler = this.#dispatcher!.onUntagged;
-        const origUntagged = this.#sessionUntagged.bind(this);
-        this.#dispatcher!.onUntagged((line) => {
-          // Dispatch to greeting handler first.
-          onGreeting(line);
-          // Then to the normal session handler.
-          origUntagged(line);
-        });
-      };
-
-      let socket: Socket;
-      if (tlsEnabled) {
-        socket = tls.connect({
-          host: this.#config.host,
-          port: this.#config.port,
-          ...this.#config.tlsOptions,
-        });
-      } else {
-        socket = new Socket();
-        socket.connect(this.#config.port, this.#config.host);
-      }
-
-      socket.once("connect", () => onReady(socket));
-      socket.once("error", (e: Error) => settle(() => reject(e)));
-    });
+  async connect(): Promise<void> {
+    const { transport, dispatcher, capabilities } = await connect(
+      this.#config,
+      this.#debugEnabled,
+    );
+    this.#transport = transport;
+    this.#dispatcher = dispatcher;
+    this.capabilities = capabilities;
+    this.#wireCallbacks();
   }
 
   async close(): Promise<void> {

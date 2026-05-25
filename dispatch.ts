@@ -62,24 +62,6 @@ export class CommandDispatcher {
   }
 
   /**
-   * Register a pending entry for a command whose tagged response will
-   * arrive later (used by IDLE).  The caller is responsible for sending
-   * the command and clearing the pending entry when done.
-   */
-  registerPending(tag: string, onTimeout: () => void): void {
-    const timer = setTimeout(() => {
-      this.#pending.delete(tag);
-      onTimeout();
-    }, this.#defaultTimeout);
-    this.#pending.set(tag, { resolve: () => {}, reject: () => {}, timer });
-  }
-
-  /** Send a raw tagged command without registering a pending entry. */
-  sendRaw(tag: string, cmd: string): void {
-    this.#transport.send(tag + " " + cmd);
-  }
-
-  /**
    * Send a tagged command.  Returns the untagged lines that arrived
    * before the matching tagged OK.  Rejects on tagged NO / BAD or
    * timeout.
