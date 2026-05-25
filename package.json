@@ -1,0 +1,8 @@
+{
+  "name": "imap-connector",
+  "version": "0.1.0",
+  "description": "Promise-based IMAP client over raw TLS",
+  "type": "module",
+  "main": "./index.ts",
+  "types": "./index.ts"
+}
