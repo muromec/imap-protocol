@@ -246,6 +246,11 @@ export class Connection {
   // so the finally block doesn't hang if the socket dies mid-drain.
   #idleDrainResolve: (() => void) | null = null;
 
+  /** Whether the connection has been closed or has errored out. */
+  get dead(): boolean {
+    return this.#dead;
+  }
+
   /**
    * Enable or disable protocol-level debug logging at runtime.
    * When enabled, raw socket reads/writes and line dispatch are
