@@ -192,7 +192,8 @@ export class MockImapServer {
           `Unexpected command after scenario finished: ${cmd}`,
         );
         this.#rejectScenario?.(err);
-        throw err;
+        this.#socket?.destroy(err);
+        return;
       }
       // auto-respond with a tagged OK so the client's sendCommand resolves
       const tagMatch = cmd.match(/^(A\d+) /);
@@ -211,7 +212,8 @@ export class MockImapServer {
             `  got:      ${cmd}`,
         );
         this.#rejectScenario?.(err);
-        throw err;
+        this.#socket?.destroy(err);
+        return;
       }
       // auto-respond with a tagged OK so the client's sendCommand resolves
       const tagMatch = cmd.match(/^(A\d+) /);

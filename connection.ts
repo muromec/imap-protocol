@@ -57,11 +57,14 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
 // ── line-oriented buffered reader ──────────────────────────────────────────
 
 /**
- * Wraps a TLS socket and yields complete IMAP lines / literals.
+ * Wraps a socket and yields complete IMAP lines / literals.
  *
  * Normal lines end with CRLF.  When a line contains a literal marker
  * `{<size>}` at the end, the reader switches to "literal mode" and
  * accumulates exactly `<size>` bytes before resuming line mode.
+ *
+ * Lines starting with `+` are IMAP continuations and are routed to
+ * `onContinue` rather than `onLine`.
  */
 class ImapReader {
   #socket: Socket;
@@ -70,6 +73,7 @@ class ImapReader {
   #literalChunks: string[] = [];
   #lineCallback: ((line: string) => void) | null = null;
   #literalCallback: ((data: string) => void) | null = null;
+  #continueCallback: ((line: string) => void) | null = null;
 
   constructor(socket: Socket) {
     this.#socket = socket;
@@ -82,6 +86,11 @@ class ImapReader {
 
   onLiteral(cb: (data: string) => void): void {
     this.#literalCallback = cb;
+  }
+
+  /** Callback for IMAP continuation lines (starting with `+`). */
+  onContinue(cb: (line: string) => void): void {
+    this.#continueCallback = cb;
   }
 
   /**
@@ -134,6 +143,12 @@ class ImapReader {
 
       if (!line) continue; // skip empty lines
 
+      // IMAP continuation lines: + optional-text
+      if (line.startsWith("+")) {
+        this.#continueCallback?.(line);
+        continue;
+      }
+
       // check for trailing literal marker on this line: ... {size}
       const litMatch = line.match(/\{(\d+)\}$/);
       if (litMatch) {
@@ -177,6 +192,9 @@ export class Connection {
   #fetchResults: FetchedMessage[] = [];
   #fetchPending = 0;
 
+  // continuation callback for IDLE/APPEND (+ lines)
+  #continuationResolve: ((line: string) => void) | null = null;
+
   constructor(config: ImapConfig) {
     this.#config = config;
   }
@@ -210,6 +228,22 @@ export class Connection {
     });
   }
 
+  // ── socket error propagation ───────────────────────────────────────────
+
+  #failAllPending(err: Error): void {
+    for (const [tag, p] of this.#pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.#pending.clear();
+    if (this.#fetchResolve) {
+      const r = this.#fetchResolve;
+      this.#fetchResolve = null;
+      this.#fetchQueue = null;
+      r(this.#fetchResults);
+    }
+  }
+
   // ── connect / close ────────────────────────────────────────────────────
 
   connect(): Promise<void> {
@@ -233,6 +267,15 @@ export class Connection {
         this.#reader = new ImapReader(socket);
         this.#reader.onLine((line) => this.#dispatchLine(line));
         this.#reader.onLiteral((data) => this.#onLiteral(data));
+        this.#reader.onContinue((line) => this.#onContinue(line));
+
+        // Propagate socket-level failures to all pending commands.
+        socket.on("close", () => {
+          this.#failAllPending(new Error("Socket closed"));
+        });
+        socket.on("error", (e) => {
+          this.#failAllPending(e);
+        });
 
         let starttlsDone = false;
 
@@ -296,6 +339,13 @@ export class Connection {
               this.#reader = new ImapReader(tlsSocket);
               this.#reader.onLine((line2) => this.#dispatchLine(line2));
               this.#reader.onLiteral((data) => this.#onLiteral(data));
+              this.#reader.onContinue((line) => this.#onContinue(line));
+              tlsSocket.on("close", () => {
+                this.#failAllPending(new Error("Socket closed"));
+              });
+              tlsSocket.on("error", (e) => {
+                this.#failAllPending(e);
+              });
               doLogin();
             }).catch((e) => settle(() => reject(e)));
             return;
@@ -334,6 +384,29 @@ export class Connection {
     } finally {
       this.#reader?.close();
     }
+  }
+
+  // ── continuation dispatch ──────────────────────────────────────────────
+
+  #onContinue(line: string): void {
+    if (this.#continuationResolve) {
+      const r = this.#continuationResolve;
+      this.#continuationResolve = null;
+      r(line);
+    }
+  }
+
+  /**
+   * Send a command that expects a `+` continuation before the tagged
+   * response.  Returns a promise that resolves with the continuation
+   * line.  The caller is responsible for sending the subsequent command
+   * and waiting for the tagged response via sendCommand.
+   */
+  sendCommandWithContinuation(cmd: string): Promise<string> {
+    return new Promise((resolve) => {
+      this.#continuationResolve = resolve;
+      this.#reader!.send(cmd);
+    });
   }
 
   // ── line dispatch ──────────────────────────────────────────────────────
@@ -380,6 +453,11 @@ export class Connection {
   // ── fetch response parsing ─────────────────────────────────────────────
 
   #handleFetchLine(line: string): void {
+    // Ignore unsolicited FETCH responses (e.g. during IDLE) when no
+    // explicit fetch is in progress.  Otherwise they leak into
+    // #fetchQueue and #fetchResults.
+    if (!this.#fetchResolve) return;
+
     const start = line.match(RE_FETCH_START);
     if (!start) return;
 
@@ -524,6 +602,9 @@ export class Connection {
     options?: { bodies?: string | string[] },
   ): Promise<FetchedMessage[]> {
     if (uids.length === 0) return Promise.resolve([]);
+    if (this.#fetchResolve) {
+      throw new Error("A fetch is already in progress; await it before starting another.");
+    }
 
     const bodies = options?.bodies ?? "";
     const bodyParts = Array.isArray(bodies) ? bodies : [bodies];
