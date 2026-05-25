@@ -58,34 +58,45 @@ server.scenario([
 
 ---
 
-## Batch 2 — connection robustness
+## Batch 2 — connection robustness ✅ COMPLETE
 
 **Goal:** Production-grade connection handling.
 
-### Features
+### Delivered
 
-| Feature | Implementation |
+All features implemented in `connection.ts`:
+
+- `connTimeout`, `authTimeout`, `commandTimeout` — with `setTimeout`/`clearTimeout`.
+- CAPABILITY detection — sent after LOGIN, populates `capabilities: Set<string>`.
+- `serverSupports(cap)` — case-insensitive lookup.
+- `openBox()` gates on `IMAP4REV1` when capabilities are known; skips check if CAPABILITY failed.
+- `tlsOptions` config forwarded to both implicit TLS and STARTTLS upgrade paths.
+- `autotls: "always" | "required"` — sends STARTTLS after greeting, upgrades socket, then LOGIN.
+- `tls` now defaults to `true` (was required).
+
+### Tests delivered (8 new, 33 total + 2 todo)
+
+| Test | Status |
 |---|---|
-| **Connection timeout** | `connTimeout` config option.  If TLS handshake + greeting don't complete within N ms, reject `connect()`. |
-| **Auth timeout** | `authTimeout` config option.  If LOGIN doesn't get a tagged response within N ms, reject. |
-| **Command timeout** | Per-command timeout (default 30s).  If a tagged response doesn't arrive, reject the command promise and reset the connection. |
-| **Capability detection** | On connect, after LOGIN, send `CAPABILITY`.  Store the result.  Expose `capabilities: Set<string>` property. |
-| **`serverSupports(cap)`** | Check `capabilities.has(cap.toUpperCase())`. |
-| **Capability gating** | `openBox()` checks for `IMAP4rev1` (minimum).  Future features gate on specific capabilities. |
-| **TLS options** | `tlsOptions` config for passing custom CA, client cert, rejectUnauthorized, etc. |
-| **STARTTLS** | `autotls: "always" | "required"` — if server doesn't support implicit TLS, send `STARTTLS` after greeting, upgrade the socket, then LOGIN.  Gated on `STARTTLS` capability. |
+| `connect()` times out on slow greeting (unroutable address) | ✅ |
+| `connect()` times out on slow LOGIN (authTimeout) | ✅ |
+| Command timeout rejects when authTimeout fires | ✅ |
+| CAPABILITY parsed into `capabilities` set | ✅ |
+| `serverSupports("IMAP4rev1")` returns true | ✅ |
+| `serverSupports("X-MADE-UP")` returns false | ✅ |
+| `openBox()` throws when IMAP4rev1 missing | ✅ |
+| `autotls: "required"` throws when STARTTLS unavailable | ✅ |
+| STARTTLS upgrade happy path | todo (needs TLS-capable mock) |
 
-### Tests
+### Deferred / untested
 
-- `connect()` times out on slow greeting.
-- `connect()` times out on slow LOGIN.
-- Command timeout triggers socket reset.
-- `CAPABILITY` response is parsed correctly.
-- `serverSupports("IMAP4rev1")` returns true.
-- `serverSupports("X-MADE-UP")` returns false.
-- `openBox()` throws if `IMAP4rev1` capability missing.
-- STARTTLS upgrade succeeds with compatible server.
-- `autotls: "required"` throws if server lacks STARTTLS.
+- **STARTTLS happy path** cannot be unit-tested with the plain-TCP mock server.
+  The code path is exercised by inspection; a TLS-capable mock (self-signed
+  cert) would be needed.  Not urgent: the project uses implicit TLS on port
+  993, so STARTTLS is never triggered in production.
+- **Per-command timeout** for non-LOGIN commands shares the same mechanism as
+  `authTimeout` and is not independently tested.
+- See `docs/untested.md` for a full catalogue of untested behaviours.
 
 ---
 
@@ -94,11 +105,42 @@ server.scenario([
 **Goal:** Real-time notification of new mail and mailbox changes without
 polling.
 
+### Prerequisites (must-fix from `docs/idle-races.md`)
+
+Before IDLE can be implemented, five race conditions must be addressed.
+These are blockers, not design choices:
+
+1. **`+` continuation handling.**  `#dispatchLine` must detect `+` lines
+   (IMAP continuations) and route them to a dedicated callback.  IDLE uses
+   `+ idling` to signal entry into idle state; APPEND uses `+` for
+   send-literal acknowledgement.  Without this, IDLE cannot work at all.
+   *(Race #4)*
+
+2. **Socket error propagation.**  A socket `"close"` or `"error"` during
+   IDLE must reject pending promises (or yield a sentinel event) rather
+   than hanging until command timeout.  The current architecture has no
+   mechanism to propagate socket-level events to `#pending` entries.
+   *(Race #10, also fixes untested.md #7)*
+
+3. **`fetch()` concurrency guard.**  Concurrent `fetch()` calls overwrite
+   each other's `#fetchResolve`, `#fetchResults`, and `#fetchQueue`.
+   Either throw if a fetch is in-flight, or maintain per-tag fetch state
+   in a `Map`.  *(Race #7)*
+
+4. **`#onLiteral` safety when `#fetchQueue` is empty.**  During IDLE,
+   unsolicited FETCH responses with body literals arrive with no queue
+   entry.  `#onLiteral` currently calls `#fetchQueue?.shift()` which
+   returns `undefined`, dropping the literal data silently.  Must either
+   emit the literal as an IDLE event or skip it cleanly.  *(Race #9)*
+
+5. **Post-DONE event drain.**  After sending `DONE`, the server may still
+   send untagged responses before the tagged OK.  The IDLE iterator must
+   continue yielding events until the tagged OK arrives.  Stopping early
+   drops events.  *(Race #2)*
+
 ### Design
 
-`IDLE` is fundamentally incompatible with a request/response model — the
-server sends untagged responses at any time while the connection is in IDLE
-state.  We model this as an `AsyncIterator`:
+Once prerequisites are addressed, `IDLE` is modelled as an `AsyncIterator`:
 
 ```ts
 interface IdleEvent {

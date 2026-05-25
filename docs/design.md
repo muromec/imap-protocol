@@ -98,35 +98,37 @@ The new module uses UIDs exclusively.  If you need "the last message", do
 `search(["ALL"])` and take the last UID.  This keeps the API surface small
 and avoids the footgun of confusing UIDs with sequence numbers.
 
-## No push events (IDLE, mailbox updates)
+## Push events — IDLE support (planned, Batch 3)
 
-The old module emitted `"mail"`, `"expunge"`, and `"update"` events when the
-server sent unsolicited untagged responses.  These require a persistent
-connection with an event loop, which fundamentally conflicts with a
-request/response promise model.
+IDLE is the single most impactful missing feature: it enables real-time
+notification of new mail without polling.  A detailed race-condition analysis
+lives in `docs/idle-races.md`.  Five prerequisites must be addressed before
+IDLE can be implemented:
 
-The new module is **polling-only**.  The caller runs a loop: open inbox,
-search unseen, fetch, process, sleep, repeat.  This matches the project's
-existing architecture (`server.ts` uses `setTimeout` + `pullInbox`) and
-keeps the connection logic stateless between operations.
+1. **`+` continuation handling** — `#dispatchLine` must detect `+` lines
+   (IMAP continuations) and route them to a dedicated callback.  IDLE and
+   APPEND both use continuations.
+2. **Socket error propagation** — a socket `"close"` or `"error"` during
+   IDLE must reject or yield a sentinel event rather than hanging forever.
+3. **`fetch()` concurrency guard** — concurrent `fetch()` calls overwrite
+   each other's internal state; a guard or per-tag state map is needed.
+4. **`#onLiteral` safety** — during IDLE, unsolicited FETCH responses with
+   body literals arrive with no `#fetchQueue` entry, causing data loss.
+5. **Post-DONE drain** — the IDLE iterator must continue yielding untagged
+   events after `DONE` is sent until the tagged OK arrives.
 
-If push is needed later, it can be added as a separate `idle()` method that
-returns an `AsyncIterator<UpdateEvent>`.
+Once these are addressed, the `idle()` method will return an
+`AsyncIterator<IdleEvent>` as described in the roadmap.
 
-## No CAPABILITY negotiation
+## CAPABILITY negotiation
 
-The old module tracked server capabilities via the `CAPABILITY` command and
-exposed `serverSupports()`.  The new module does not negotiate capabilities.
-It assumes a reasonably modern IMAP server that supports:
+`connect()` sends `CAPABILITY` after LOGIN and populates `capabilities:
+Set<string>`.  `serverSupports(cap)` provides case-insensitive lookups.
+`openBox()` gates on `IMAP4REV1` when capabilities are known (gracefully
+skips the check if the server didn't respond to CAPABILITY).
 
-- `UID SEARCH`
-- `UID FETCH`
-- `UID STORE`
-- Literal syntax `{size}`
-
-These are universal on any server from the last 20 years.  If a specific
-extension is needed (CONDSTORE, MOVE, etc.), capability detection can be
-added to `connect()` and the relevant methods gated behind it.
+Future features (`MOVE`, `IDLE`, `CONDSTORE`) should gate on their
+respective capabilities.  The Capability detection was added in Batch 2.
 
 ## Authentication: password only
 
@@ -171,12 +173,22 @@ Charset detection and nested `OR` groups can be added when needed.
   `connect()` promise.
 - **Protocol errors** (tagged NO/BAD responses) reject the command promise
   with the server's error text.
+- **Timeouts** — `connTimeout`, `authTimeout`, and `commandTimeout` reject
+  with descriptive messages.  Auth timeout is tested; the shared timeout
+  mechanism covers all commands.
 - **Untagged BYE** is not yet handled — the socket will emit `"close"` but
-  no promise is rejected.  The next command will fail.
+  no promise is rejected.  The next command will fail.  Tracked as a
+  medium-risk concern in `docs/untested.md` (#6).
+- **Socket errors mid-command** are not propagated to pending promises.
+  The command hangs until timeout (30 s default).  Tracked as a
+  medium-high risk concern in `docs/untested.md` (#7).  This must be
+  fixed before IDLE can be implemented (see `docs/idle-races.md` #10).
 - **`fetch()` never rejects** on protocol errors — if the server returns
   fewer results than requested, the caller gets what was returned.  This
   matches the old `node-imap` behaviour where non-existent UIDs silently
   produce no results.
+- **Concurrent `fetch()` calls** corrupt internal state (untested concern
+  #8, idle-races #7).  A guard should be added before IDLE.
 
 ## Module structure
 
@@ -186,23 +198,25 @@ vendored/imap-connector/
 ├── index.ts                barrel re-export
 ├── connection.ts           ImapReader (line/literal framing) + Connection (async API)
 ├── mock.ts                 scenario-based mock IMAP server
-├── connection.test.ts      25 unit tests + 1 todo (vitest)
+├── connection.test.ts      33 unit tests + 2 todo (vitest, ~1s)
 ├── test-integration.ts     integration test against real server
 └── docs/
     ├── design.md           this file
-    └── roadmap.md          phased feature plan (batches 1-8)
+    ├── roadmap.md          phased feature plan (batches 1-8)
+    ├── untested.md         catalogue of untested behaviours with risk assessments
+    └── idle-races.md       race condition analysis for IDLE implementation
 ```
 
 ## What the module is not
 
 - **Not a general-purpose IMAP client.**  It does mailbox polling, not
   message composition.  It does UID-based operations, not sequence numbers.
-  It polls, it doesn't push.
+  Push support (IDLE) is planned but not yet implemented.
 
-- **Not a replacement for `imap-module`'s full API.**  It covers the ~10% of
-  the API that the project actually uses.  The remaining 90% (mailbox CRUD,
-  COPY/MOVE, APPEND, IDLE, SORT, THREAD, quota, Gmail extensions, etc.) is
-  deliberately omitted and tracked in the roadmap.
+- **Not a replacement for `imap-module`'s full API.**  It covers the ~15% of
+  the API that the project uses (polling + robustness).  The remaining 85%
+  (mailbox CRUD, COPY/MOVE, APPEND, IDLE, SORT, THREAD, quota, Gmail
+  extensions, etc.) is tracked in the roadmap.
 
 - **Not a streaming parser.**  `BODY.PEEK[]` returns the entire message as a
   single string.  For large messages with attachments, this could be
@@ -213,3 +227,7 @@ vendored/imap-connector/
   handler only processes the first `BODY[...]` literal on each `* N FETCH`
   line.  Responses with multiple body parts on continuation lines require a
   proper FETCH response parser (tracked as a `todo` test).
+
+- **Documented limitations.**  `docs/untested.md` catalogues 12 untested
+  behaviours with risk assessments.  `docs/idle-races.md` analyses 12 race
+  conditions for the planned IDLE feature.
