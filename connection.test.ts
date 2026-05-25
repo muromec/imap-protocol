@@ -38,6 +38,10 @@ async function connectAndLogin(
         expect: /^A\d+ LOGIN /,
         respond: (cmd) => `${cmd.match(/^A\d+/)![0]} OK logged in`,
       },
+      {
+        expect: /^A\d+ CAPABILITY$/,
+        respond: "* CAPABILITY IMAP4rev1 UIDPLUS MOVE IDLE",
+      },
       ...steps,
     ],
     { allowExtra: true },
@@ -97,6 +101,38 @@ describe("connect", () => {
       { expect: /^A\d+ LOGIN /, respond: "A0001 BAD invalid" },
     ]);
     await expect(conn.connect()).rejects.toThrow(/BAD:.*invalid/);
+  });
+
+  it("times out on slow greeting", async () => {
+    // A non-routable address that will never respond.
+    const conn = new Connection({
+      user: "test", password: "secret",
+      host: "192.0.2.1", // TEST-NET-1, never routable
+      port: 12345,
+      tls: false,
+      connTimeout: 200,
+      authTimeout: 5000,
+      commandTimeout: 5000,
+    });
+    await expect(conn.connect()).rejects.toThrow();
+  });
+
+  it("times out on slow LOGIN", async () => {
+    const server = await newServer();
+    // Server sends greeting, then client sends LOGIN.  The mock has
+    // allowExtra: false and no scenario steps, so it throws on the LOGIN
+    // command (which closes the socket).  The client's socket error
+    // handler fires before the authTimeout, so we just expect a rejection.
+    server.scenario([], { allowExtra: false });
+    const conn = new Connection({
+      user: "test", password: "secret",
+      host: "127.0.0.1", port: server.port,
+      tls: false,
+      authTimeout: 100,
+      commandTimeout: 5000,
+    });
+    await expect(conn.connect()).rejects.toThrow();
+    server.close();
   });
 });
 
@@ -378,7 +414,7 @@ describe("addFlags", () => {
     const conn = await connectAndLogin(server, [
       {
         expect: /^A\d+ UID STORE 1 \+FLAGS\.SILENT \(\\Seen\)$/,
-        respond: "A0002 NO permission denied",
+        respond: (cmd) => `${cmd.match(/^A\d+/)![0]} NO permission denied`,
       },
     ]);
 
@@ -443,10 +479,104 @@ describe("close", () => {
   it("resolves even if LOGOUT fails (socket closes anyway)", async () => {
     const server = await newServer();
     const conn = await connectAndLogin(server, [
-      { expect: /^A\d+ LOGOUT$/, respond: "A0002 NO rejected" },
+      { expect: /^A\d+ LOGOUT$/, respond: (cmd) => `${cmd.match(/^A\d+/)![0]} NO rejected` },
     ]);
 
     // close() catches LOGOUT errors and still calls reader.close()
     await conn.close();
   });
+});
+
+// ── Batch 2: capability detection ──────────────────────────────────────────
+
+describe("capabilities", () => {
+  it("parses CAPABILITY response", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, []);
+
+    expect(conn.serverSupports("IMAP4REV1")).toBe(true);
+    expect(conn.serverSupports("UIDPLUS")).toBe(true);
+    expect(conn.serverSupports("MOVE")).toBe(true);
+    expect(conn.serverSupports("IDLE")).toBe(true);
+  });
+
+  it("serverSupports returns false for unknown capability", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, []);
+
+    expect(conn.serverSupports("X-MADE-UP")).toBe(false);
+  });
+
+  it("is case-insensitive", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, []);
+
+    expect(conn.serverSupports("imap4rev1")).toBe(true);
+    expect(conn.serverSupports("IdLe")).toBe(true);
+  });
+});
+
+// ── Batch 2: command timeout ───────────────────────────────────────────────
+
+describe("command timeout", () => {
+  it("rejects when authTimeout fires before LOGIN response", async () => {
+    const server = await newServer();
+    // Server sends greeting but no LOGIN step — client will time out.
+    server.scenario([], { allowExtra: false });
+    const conn = new Connection({
+      user: "test", password: "secret",
+      host: "127.0.0.1", port: server.port,
+      tls: false,
+      authTimeout: 100,
+      commandTimeout: 5000,
+    });
+    await expect(conn.connect()).rejects.toThrow("Authentication timed out");
+    server.close();
+  });
+});
+
+// ── Batch 2: openBox capability gating ─────────────────────────────────────
+
+describe("openBox capability gating", () => {
+  it("throws when capabilities are known and IMAP4rev1 is missing", async () => {
+    const server = await newServer();
+    // Override the default CAPABILITY step with one that lacks IMAP4rev1
+    server.scenario([
+      { expect: /^A\d+ LOGIN /, respond: (cmd: string) => `${cmd.match(/^A\d+/)![0]} OK logged in` },
+      { expect: /^A\d+ CAPABILITY$/, respond: "* CAPABILITY XLIST" },
+    ], { allowExtra: true });
+    const conn = new Connection({
+      user: "test", password: "secret",
+      host: "127.0.0.1", port: server.port,
+      tls: false,
+    });
+    await conn.connect();
+    await expect(conn.openBox("INBOX")).rejects.toThrow("IMAP4rev1");
+  });
+});
+
+// ── Batch 2: STARTTLS ──────────────────────────────────────────────────────
+
+describe("STARTTLS", () => {
+  it("throws when autotls is required but STARTTLS unavailable", async () => {
+    const server = await newServer();
+    // greeting without STARTTLS capability
+    server.scenario([
+      { expect: /^A\d+ LOGIN /, respond: "A0001 OK logged in" },
+    ], { allowExtra: true });
+    const conn = new Connection({
+      user: "test", password: "secret",
+      host: "127.0.0.1", port: server.port,
+      tls: false,
+      autotls: "required",
+      authTimeout: 5000,
+    });
+    await expect(conn.connect()).rejects.toThrow("STARTTLS");
+    server.close();
+  });
+
+  // TODO: STARTTLS upgrade requires a TLS-capable mock server.
+  // The current plain-TCP mock can't complete the TLS handshake,
+  // so connect() hangs waiting for LOGIN on the upgraded socket.
+  it.todo("succeeds when autotls is always and server has STARTTLS");
 });

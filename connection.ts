@@ -8,7 +8,23 @@ export interface ImapConfig {
   password: string;
   host: string;
   port: number;
-  tls: boolean;
+  /** Use implicit TLS (port 993). Default true. Set false for plain TCP. */
+  tls?: boolean;
+  /** TLS options passed to tls.connect(). */
+  tlsOptions?: tls.ConnectionOptions;
+  /**
+   * STARTTLS upgrade strategy.
+   * - "always": attempt STARTTLS if server supports it
+   * - "required": require STARTTLS, throw if unavailable
+   * - undefined: never attempt STARTTLS (only use implicit TLS or plain)
+   */
+  autotls?: "always" | "required";
+  /** Timeout for TLS handshake + server greeting (ms). Default 30_000. */
+  connTimeout?: number;
+  /** Timeout for LOGIN response (ms). Default 10_000. */
+  authTimeout?: number;
+  /** Per-command timeout (ms). Default 30_000. */
+  commandTimeout?: number;
 }
 
 export interface MailboxInfo {
@@ -36,6 +52,7 @@ const RE_RECENT = /^\* (\d+) RECENT/;
 const RE_FLAGS = /^\* FLAGS \((.*)\)/;
 const RE_SEARCH = /^\* SEARCH (.*)/;
 const RE_FETCH_START = /^\* (\d+) FETCH \((.*)/;
+const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
 
 // ── line-oriented buffered reader ──────────────────────────────────────────
 
@@ -47,14 +64,14 @@ const RE_FETCH_START = /^\* (\d+) FETCH \((.*)/;
  * accumulates exactly `<size>` bytes before resuming line mode.
  */
 class ImapReader {
-  #socket: tls.TLSSocket;
+  #socket: Socket;
   #buf = "";
   #literalRemaining = 0;
   #literalChunks: string[] = [];
   #lineCallback: ((line: string) => void) | null = null;
   #literalCallback: ((data: string) => void) | null = null;
 
-  constructor(socket: tls.TLSSocket) {
+  constructor(socket: Socket) {
     this.#socket = socket;
     socket.on("data", (chunk: Buffer) => this.#onData(chunk.toString("utf8")));
   }
@@ -147,10 +164,13 @@ export class Connection {
   #tag = 0;
   #pending = new Map<
     string,
-    { resolve: (lines: string[]) => void; reject: (e: Error) => void }
+    { resolve: (lines: string[]) => void; reject: (e: Error) => void; timer?: ReturnType<typeof setTimeout> }
   >();
   #untagged: string[] = [];
   #mailboxInfo: MailboxInfo | null = null;
+
+  /** Server capabilities discovered after LOGIN. */
+  readonly capabilities = new Set<string>();
 
   // fetch state
   #fetchResolve: ((msgs: FetchedMessage[]) => void) | null = null;
@@ -161,6 +181,14 @@ export class Connection {
     this.#config = config;
   }
 
+  /**
+   * Check whether the server advertises a given capability.
+   * Capability names are compared case-insensitively.
+   */
+  serverSupports(cap: string): boolean {
+    return this.capabilities.has(cap.toUpperCase());
+  }
+
   // ── protocol helpers ───────────────────────────────────────────────────
 
   #nextTag(): string {
@@ -169,8 +197,14 @@ export class Connection {
 
   sendCommand(cmd: string): Promise<string[]> {
     const tag = this.#nextTag();
+    const timeout = this.#config.commandTimeout ?? 30_000;
     return new Promise((resolve, reject) => {
-      this.#pending.set(tag, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.#pending.delete(tag);
+        this.#reader?.close();
+        reject(new Error(`Command timed out: ${cmd.slice(0, 50)}`));
+      }, timeout);
+      this.#pending.set(tag, { resolve, reject, timer });
       this.#untagged = [];
       this.#reader!.send(tag + " " + cmd);
     });
@@ -179,41 +213,116 @@ export class Connection {
   // ── connect / close ────────────────────────────────────────────────────
 
   connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const onConnect = (socket: Socket) => {
-        this.#reader = new ImapReader(socket);
+    const tlsEnabled = this.#config.tls !== false;
+    const connTimeout = this.#config.connTimeout ?? 30_000;
+    const authTimeout = this.#config.authTimeout ?? 10_000;
 
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (fn: () => void) => {
+        if (!settled) { settled = true; fn(); }
+      };
+
+      // connection timeout
+      const connTimer = setTimeout(() => {
+        settle(() => reject(new Error("Connection timed out")));
+      }, connTimeout);
+
+      const onReady = (socket: Socket) => {
+        clearTimeout(connTimer);
+        this.#reader = new ImapReader(socket);
         this.#reader.onLine((line) => this.#dispatchLine(line));
         this.#reader.onLiteral((data) => this.#onLiteral(data));
 
-        // Wait for greeting then LOGIN
-        const onGreeting = (line: string) => {
-          if (line.startsWith("* OK") || line.startsWith("* PREAUTH")) {
-            // remove this ad-hoc listener — greeting handled
-            this.#reader!.onLine((l) => this.#dispatchLine(l));
-            this.sendCommand(
-              `LOGIN "${this.#config.user}" "${this.#config.password}"`,
-            )
-              .then(() => resolve())
-              .catch(reject);
-          }
+        let starttlsDone = false;
+
+        const doLogin = () => {
+          // auth timeout
+          const authTimer = setTimeout(() => {
+            settle(() => reject(new Error("Authentication timed out")));
+          }, authTimeout);
+
+          this.sendCommand(
+            `LOGIN "${this.#config.user}" "${this.#config.password}"`,
+          )
+            .then(() => {
+              clearTimeout(authTimer);
+              // CAPABILITY detection
+              this.sendCommand("CAPABILITY").then((lines) => {
+                for (const line of lines) {
+                  const m = line.match(/^\* CAPABILITY (.*)/i);
+                  if (m) {
+                    for (const cap of m[1].split(/\s+/)) {
+                      this.capabilities.add(cap.toUpperCase());
+                    }
+                  }
+                }
+                settle(() => resolve());
+              }).catch(() => {
+                // best-effort: resolve even if CAPABILITY fails
+                settle(() => resolve());
+              });
+            })
+            .catch((e) => settle(() => reject(e)));
         };
-        // override temporarily for greeting
+
+        const onGreeting = (line: string) => {
+          if (!line.startsWith("* OK") && !line.startsWith("* PREAUTH")) return;
+
+          // check for STARTTLS in greeting capabilities
+          const greetCaps = line.match(/CAPABILITY (.*)/i);
+          const hasStarttls = greetCaps
+            ? greetCaps[1].split(/\s+/).some((c) => c.toUpperCase() === "STARTTLS")
+            : false;
+
+          const wantStarttls = this.#config.autotls === "always" || this.#config.autotls === "required";
+          const canStarttls = !tlsEnabled && hasStarttls;
+
+          if (wantStarttls && !canStarttls && this.#config.autotls === "required") {
+            settle(() => reject(new Error("STARTTLS required but not available")));
+            return;
+          }
+
+          if (canStarttls && wantStarttls && !starttlsDone) {
+            starttlsDone = true;
+            this.#reader!.onLine((l) => this.#dispatchLine(l));
+            this.sendCommand("STARTTLS").then(() => {
+              const rawSocket = socket;
+              const tlsSocket = tls.connect({
+                socket: rawSocket,
+                host: this.#config.host,
+                ...this.#config.tlsOptions,
+              });
+              this.#reader = new ImapReader(tlsSocket);
+              this.#reader.onLine((line2) => this.#dispatchLine(line2));
+              this.#reader.onLiteral((data) => this.#onLiteral(data));
+              doLogin();
+            }).catch((e) => settle(() => reject(e)));
+            return;
+          }
+
+          // no STARTTLS — proceed to login
+          this.#reader!.onLine((l) => this.#dispatchLine(l));
+          doLogin();
+        };
+
         this.#reader.onLine(onGreeting);
       };
 
       let socket: Socket;
-      if (this.#config.tls) {
-        socket = tls.connect(
-          { host: this.#config.host, port: this.#config.port },
-        );
+      if (tlsEnabled) {
+        socket = tls.connect({
+          host: this.#config.host,
+          port: this.#config.port,
+          ...this.#config.tlsOptions,
+        });
       } else {
         socket = new Socket();
         socket.connect(this.#config.port, this.#config.host);
       }
 
-      socket.once("connect", () => onConnect(socket));
-      socket.once("error", reject);
+      socket.once("connect", () => onReady(socket));
+      socket.once("error", (e) => settle(() => reject(e)));
     });
   }
 
@@ -236,6 +345,7 @@ export class Connection {
       const p = this.#pending.get(tag);
       if (!p) return;
       this.#pending.delete(tag);
+      clearTimeout(p.timer);
 
       if (status === "OK") {
         p.resolve([...this.#untagged]);
@@ -346,6 +456,12 @@ export class Connection {
   // ── mailbox ─────────────────────────────────────────────────────────────
 
   async openBox(name: string, readOnly = false): Promise<MailboxInfo> {
+    // Only gate if we actually fetched capabilities (non-empty set).
+    // Servers that don't respond to CAPABILITY are assumed to be
+    // IMAP4rev1-compliant.
+    if (this.capabilities.size > 0 && !this.serverSupports("IMAP4REV1")) {
+      throw new Error("Server does not support IMAP4rev1");
+    }
     const cmd = readOnly ? "EXAMINE" : "SELECT";
     const lines = await this.sendCommand(`${cmd} "${name}"`);
 
