@@ -43,6 +43,14 @@ export interface FetchedMessage {
   flags: string[];
 }
 
+export interface IdleEvent {
+  type: "exists" | "recent" | "expunge" | "fetch" | "flags";
+  seqno?: number;
+  count?: number;
+  uid?: number;
+  flags?: string[];
+}
+
 // ── IMAP protocol constants ────────────────────────────────────────────────
 
 const CRLF = "\r\n";
@@ -194,6 +202,10 @@ export class Connection {
 
   // continuation callback for IDLE/APPEND (+ lines)
   #continuationResolve: ((line: string) => void) | null = null;
+
+  // idle event hook — called from #dispatchLine for every untagged line
+  // during an active IDLE session.  Null when not idling.
+  #idleHook: ((line: string) => void) | null = null;
 
   constructor(config: ImapConfig) {
     this.#config = config;
@@ -414,6 +426,10 @@ export class Connection {
   #dispatchLine(line: string): void {
     const tagged = line.match(RE_TAGGED);
     if (tagged) {
+      // Let the idle hook see the tagged response — it may be the OK for
+      // the IDLE command, which signals the end of the drain phase.
+      if (this.#idleHook) this.#idleHook(line);
+
       const [, tag, status] = tagged;
       const p = this.#pending.get(tag);
       if (!p) return;
@@ -426,6 +442,11 @@ export class Connection {
         p.reject(new Error(status + ": " + line));
       }
       return;
+    }
+
+    // Idle hook consumes untagged lines when active.
+    if (this.#idleHook) {
+      this.#idleHook(line);
     }
 
     // untagged
@@ -644,6 +665,156 @@ export class Connection {
     const uids = await this.search(["UNSEEN"]);
     if (uids.length === 0) return [];
     return this.fetch(uids);
+  }
+
+  // ── idle ────────────────────────────────────────────────────────────────
+
+  /**
+   * Enter IDLE mode and yield real-time mailbox events.
+   *
+   * The caller must iterate with `for await (const event of conn.idle())`.
+   * Breaking out of the loop (or calling `.return()` on the iterator) sends
+   * DONE and drains remaining untagged events before resolving.
+   *
+   * Throws if the server does not advertise the IDLE capability.
+   */
+  async *idle(): AsyncIterable<IdleEvent> {
+    if (!this.serverSupports("IDLE")) {
+      throw new Error("Server does not support IDLE");
+    }
+
+    // Tag for this IDLE session.
+    this.#idleTag = this.#nextTag();
+    const timer = setTimeout(() => {
+      this.#pending.delete(this.#idleTag);
+      this.#reader?.close();
+    }, this.#config.commandTimeout ?? 30_000);
+    this.#pending.set(this.#idleTag, {
+      resolve: () => {}, reject: () => {}, timer,
+    });
+    this.#untagged = [];
+
+    // Install the idle hook BEFORE sending the command so we catch
+    // events that arrive synchronously with the server response.
+    let eventResolve: ((ev: IdleEvent | null) => void) | null = null;
+    const eventQueue: IdleEvent[] = [];
+    let done = false;
+
+    const pushIdleEvent = (ev: IdleEvent) => {
+      if (done) {
+        eventQueue.push(ev);
+      } else if (eventResolve) {
+        eventResolve(ev);
+        eventResolve = null;
+      }
+    };
+
+    let drainResolve: (() => void) | null = null;
+    const idleTag = this.#idleTag;
+
+    this.#idleHook = (line: string) => {
+      const tagged = line.match(RE_TAGGED);
+      if (tagged) {
+        if (tagged[1] === idleTag) {
+          // Tagged OK for our IDLE command — end of drain.
+          this.#idleHook = null;
+          if (drainResolve) drainResolve();
+        }
+        return;
+      }
+      const ev = this.#parseIdleEvent(line);
+      if (ev) pushIdleEvent(ev);
+    };
+
+    // Send IDLE and wait for continuation.
+    const continuationPromise: Promise<string> = new Promise((resolve) => {
+      this.#continuationResolve = resolve;
+    });
+    this.#reader!.send(this.#idleTag + " IDLE");
+
+    const contLine = await continuationPromise;
+    if (!contLine.startsWith("+")) {
+      this.#idleHook = null;
+      throw new Error(`Expected continuation, got: ${contLine}`);
+    }
+
+    // Yield events as they arrive.
+    try {
+      while (!done) {
+        const event = await new Promise<IdleEvent | null>((resolve) => {
+          eventResolve = resolve;
+        });
+        if (event === null) break;
+        yield event;
+      }
+    } finally {
+      // DONE
+      done = true;
+
+      // Send DONE
+      this.#reader!.send("DONE");
+
+      // Drain: wait for tagged OK for IDLE
+      await new Promise<void>((resolve) => {
+        drainResolve = resolve;
+      });
+
+      // Yield any events that arrived after DONE but before tagged OK.
+      for (const ev of eventQueue) {
+        yield ev;
+      }
+
+      // Clean up hook (may already be cleared by tagged OK).
+      this.#idleHook = null;
+    }
+  }
+
+  // Tag of the current IDLE command, set when idle() is called.
+  #idleTag: string = "";
+
+  /**
+   * Parse an untagged IMAP line into an IdleEvent, or null if the line
+   * is not a recognised idle event type.
+   */
+  #parseIdleEvent(line: string): IdleEvent | null {
+    const exists = line.match(RE_EXISTS);
+    if (exists) {
+      return { type: "exists", count: Number(exists[1]) };
+    }
+
+    const recent = line.match(RE_RECENT);
+    if (recent) {
+      return { type: "recent", count: Number(recent[1]) };
+    }
+
+    const expunge = line.match(/^\* (\d+) EXPUNGE/);
+    if (expunge) {
+      return { type: "expunge", seqno: Number(expunge[1]) };
+    }
+
+    const fetchStart = line.match(RE_FETCH_START);
+    if (fetchStart) {
+      const rest = fetchStart[2];
+      const uidMatch = rest.match(/UID (\d+)/);
+      const flagsMatch = rest.match(/FLAGS \(([^)]*)\)/);
+      return {
+        type: "fetch",
+        seqno: Number(fetchStart[1]),
+        uid: uidMatch ? Number(uidMatch[1]) : undefined,
+        flags: flagsMatch ? flagsMatch[1].split(" ").filter(Boolean) : [],
+      };
+    }
+
+    const flags = line.match(/^\* (\d+) FETCH \(FLAGS \(([^)]*)\)\)/);
+    if (flags) {
+      return {
+        type: "flags",
+        seqno: Number(flags[1]),
+        flags: flags[2].split(" ").filter(Boolean),
+      };
+    }
+
+    return null;
   }
 }
 

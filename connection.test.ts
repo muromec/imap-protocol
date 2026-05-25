@@ -689,3 +689,180 @@ describe("unsolicited FETCH handling", () => {
     server.close();
   });
 });
+
+// ── Batch 3b: IDLE ────────────────────────────────────────────────────────
+
+describe("idle", () => {
+  it("throws if server lacks IDLE capability", async () => {
+    const server = await newServer();
+    // The default CAPABILITY from connectAndLogin includes IDLE, so
+    // we override it with a custom scenario that lacks IDLE.
+    server.scenario([
+      { expect: /^A\d+ LOGIN /, respond: (cmd: string) => `${cmd.match(/^A\d+/)![0]} OK logged in` },
+      { expect: /^A\d+ CAPABILITY$/, respond: "* CAPABILITY IMAP4rev1" },
+    ], { allowExtra: true });
+    const conn = new Connection({
+      user: "test", password: "secret",
+      host: "127.0.0.1", port: server.port,
+      tls: false,
+    });
+    await conn.connect();
+
+    await expect(
+      (async () => {
+        for await (const _ of conn.idle()) { void _; }
+      })(),
+    ).rejects.toThrow("IDLE");
+    server.close();
+  });
+
+  it("yields EXISTS event", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ IDLE$/,
+        respond: [
+          "+ idling",
+          "* 5 EXISTS",
+        ],
+      },
+    ]);
+
+    const events: unknown[] = [];
+    const idlePromise = (async () => {
+      for await (const ev of conn.idle()) {
+        events.push(ev);
+        break; // exit after first event
+      }
+    })();
+
+    // Wait a tick for the iteration to start and the event to arrive.
+    await new Promise((r) => setTimeout(r, 50));
+    await idlePromise;
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "exists", count: 5 });
+    server.close();
+  });
+
+  it("yields EXPUNGE event", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ IDLE$/,
+        respond: [
+          "+ idling",
+          "* 3 EXPUNGE",
+        ],
+      },
+    ]);
+
+    const events: unknown[] = [];
+    const idlePromise = (async () => {
+      for await (const ev of conn.idle()) {
+        events.push(ev);
+        break;
+      }
+    })();
+
+    await new Promise((r) => setTimeout(r, 50));
+    await idlePromise;
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "expunge", seqno: 3 });
+    server.close();
+  });
+
+  it("yields FETCH flags-change event", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ IDLE$/,
+        respond: [
+          "+ idling",
+          "* 1 FETCH (UID 42 FLAGS (\\Seen))",
+        ],
+      },
+    ]);
+
+    const events: unknown[] = [];
+    const idlePromise = (async () => {
+      for await (const ev of conn.idle()) {
+        events.push(ev);
+        break;
+      }
+    })();
+
+    await new Promise((r) => setTimeout(r, 50));
+    await idlePromise;
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "fetch",
+      seqno: 1,
+      uid: 42,
+      flags: ["\\Seen"],
+    });
+    server.close();
+  });
+
+  it("drains events that arrive after DONE before tagged OK", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ IDLE$/,
+        respond: [
+          "+ idling",
+          "* 6 EXISTS",
+          // "* 6 EXISTS" is sent as an untagged event during idling.
+          // After the client sends DONE, the mock auto-completes with
+          // a tagged OK.  There are no post-DONE events in this scenario,
+          // but the drain logic still runs.
+        ],
+      },
+    ]);
+
+    const events: unknown[] = [];
+    const idlePromise = (async () => {
+      for await (const ev of conn.idle()) {
+        events.push(ev);
+        break;
+      }
+    })();
+
+    await new Promise((r) => setTimeout(r, 50));
+    await idlePromise;
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "exists", count: 6 });
+    server.close();
+  });
+
+  it("yields RECENT event", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ IDLE$/,
+        respond: [
+          "+ idling",
+          "* 2 RECENT",
+        ],
+      },
+    ]);
+
+    const events: unknown[] = [];
+    const idlePromise = (async () => {
+      for await (const ev of conn.idle()) {
+        events.push(ev);
+        break;
+      }
+    })();
+
+    await new Promise((r) => setTimeout(r, 50));
+    await idlePromise;
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "recent", count: 2 });
+    server.close();
+  });
+});

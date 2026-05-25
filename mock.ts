@@ -45,6 +45,7 @@ export class MockImapServer {
   #resolveScenario: (() => void) | null = null;
   #rejectScenario: ((e: Error) => void) | null = null;
   #scenarioPromise: Promise<void> | null = null;
+  #idleTag: string | null = null;
 
   /** The port the server is listening on. Set once listening resolves. */
   port!: number;
@@ -186,6 +187,18 @@ export class MockImapServer {
   // ── command dispatch ───────────────────────────────────────────────────
 
   #handleCommand(cmd: string): void {
+    // DONE is sent without a tag to exit IDLE.  Handle it before the
+    // normal scenario-matching logic, since it has no tag and isn't
+    // part of the expected step list.
+    if (cmd.trim() === "DONE" && this.#idleTag !== null) {
+      this.#sendRaw(`${this.#idleTag} OK IDLE completed` + CRLF);
+      this.#idleTag = null;
+      if (this.#step >= this.#scenario.length) {
+        this.#resolveScenario?.();
+      }
+      return;
+    }
+
     if (this.#step >= this.#scenario.length) {
       if (!this.#options.allowExtra) {
         const err = new Error(
@@ -230,11 +243,34 @@ export class MockImapServer {
 
     const response =
       typeof step.respond === "function" ? step.respond(cmd) : step.respond;
-    this.#sendMulti(response);
+
+    // Check if the response starts with a continuation marker (+).
+    // If so, send it as a continuation (no auto-tagged OK) and enter
+    // a special mode where subsequent untagged lines are served from
+    // a queue until the client sends DONE.
+    const lines = Array.isArray(response) ? response : [response];
+    const firstLine = lines[0] ?? "";
+    if (firstLine.startsWith("+")) {
+      // Send the continuation line.
+      this.#sendRaw(firstLine + CRLF);
+
+      // Remaining lines are untagged events to send while idling.
+      const events = lines.slice(1);
+      for (const ev of events) {
+        this.#sendRaw(ev + CRLF);
+      }
+
+      // Store tag for when DONE arrives.
+      this.#idleTag = tag;
+      // Don't send tagged OK — the IDLE command stays open until DONE.
+      // Don't call #resolveScenario yet — scenario completes on DONE.
+      return;
+    }
+
+    this.#sendMulti(lines);
 
     // Append tagged OK completion if the response doesn't already include one.
     // Each command (except IDLE) must be terminated by a tagged OK/NO/BAD.
-    const lines = Array.isArray(response) ? response : [response];
     const lastLine = lines[lines.length - 1] ?? "";
     if (!/^A\d+ (OK|NO|BAD) /.test(lastLine)) {
       this.#sendRaw(`${tag} OK done` + CRLF);
