@@ -105,42 +105,47 @@ All features implemented in `connection.ts`:
 **Goal:** Real-time notification of new mail and mailbox changes without
 polling.
 
-### Prerequisites (must-fix from `docs/idle-races.md`)
+### Batch 3a — Prerequisites ✅ COMPLETE
 
-Before IDLE can be implemented, five race conditions must be addressed.
-These are blockers, not design choices:
+Four of five blockers identified in `docs/idle-races.md` have been addressed
+in `connection.ts`.  These are independently useful improvements that also
+unblock IDLE:
 
-1. **`+` continuation handling.**  `#dispatchLine` must detect `+` lines
-   (IMAP continuations) and route them to a dedicated callback.  IDLE uses
-   `+ idling` to signal entry into idle state; APPEND uses `+` for
-   send-literal acknowledgement.  Without this, IDLE cannot work at all.
-   *(Race #4)*
+1. ✅ **`+` continuation handling** — `ImapReader` detects `+` lines and
+   routes them to `onContinue`.  `Connection` exposes
+   `sendCommandWithContinuation()` for IDLE/APPEND.  *(Race #4)*
 
-2. **Socket error propagation.**  A socket `"close"` or `"error"` during
-   IDLE must reject pending promises (or yield a sentinel event) rather
-   than hanging until command timeout.  The current architecture has no
-   mechanism to propagate socket-level events to `#pending` entries.
-   *(Race #10, also fixes untested.md #7)*
+2. ✅ **Socket error propagation** — `#failAllPending()` rejects all
+   outstanding promises on socket `"close"` or `"error"`.  The mock server
+   destroys the socket on unexpected commands.  *(Race #10, also fixes
+   untested.md #7)*
 
-3. **`fetch()` concurrency guard.**  Concurrent `fetch()` calls overwrite
-   each other's `#fetchResolve`, `#fetchResults`, and `#fetchQueue`.
-   Either throw if a fetch is in-flight, or maintain per-tag fetch state
-   in a `Map`.  *(Race #7)*
+3. ✅ **`fetch()` concurrency guard** — `fetch()` throws `"A fetch is
+   already in progress"` if called while another fetch is in-flight.
+   *(Race #7)*
 
-4. **`#onLiteral` safety when `#fetchQueue` is empty.**  During IDLE,
-   unsolicited FETCH responses with body literals arrive with no queue
-   entry.  `#onLiteral` currently calls `#fetchQueue?.shift()` which
-   returns `undefined`, dropping the literal data silently.  Must either
-   emit the literal as an IDLE event or skip it cleanly.  *(Race #9)*
+4. ✅ **`#onLiteral` / `#handleFetchLine` safety** — `#handleFetchLine`
+   returns early when no `#fetchResolve` is set, preventing unsolicited
+   FETCH responses during IDLE from leaking into fetch state.  *(Race #9)*
 
-5. **Post-DONE event drain.**  After sending `DONE`, the server may still
-   send untagged responses before the tagged OK.  The IDLE iterator must
-   continue yielding events until the tagged OK arrives.  Stopping early
-   drops events.  *(Race #2)*
+The fifth prerequisite — **post-DONE event drain** *(Race #2)* — is deferred
+to the `idle()` implementation itself (Batch 3b).
+
+### Tests delivered (5 new, 37 total + 2 todo)
+
+| Test | Status |
+|---|---|
+| Socket close rejects pending commands | ✅ |
+| `fetch()` throws when called concurrently | ✅ |
+| `sendCommandWithContinuation()` is callable | ✅ |
+| Unsolicited FETCH during non-fetch is ignored | ✅ |
+| Socket error propagation (socket error test) | merged into close test |
+
+### Batch 3b — IDLE implementation (next)
 
 ### Design
 
-Once prerequisites are addressed, `IDLE` is modelled as an `AsyncIterator`:
+`IDLE` is modelled as an `AsyncIterator`:
 
 ```ts
 interface IdleEvent {

@@ -89,26 +89,30 @@ resolve immediately.  This bug exists in the current code.
 ## 6. Untagged BYE during a command
 
 **What is untested.**  If the server sends `* BYE` while a command is
-pending, the socket eventually closes.  The client does not detect the BYE
-and rejects the pending command only when the socket `"close"` event fires
-(or the command timeout expires).
+pending, the socket eventually closes.  The client now rejects pending
+commands immediately when the socket closes (via `#failAllPending`, added
+in Batch 3a), so the hang is at most the TCP round-trip time after the
+server sends BYE and closes the connection.  However, the client does not
+parse the `* BYE` line itself — it relies on the subsequent socket close.
 
-**Risk.**  **Medium.**  The pending command hangs until the command timeout
-(30 s by default).  A better implementation would reject immediately on
-`* BYE`.  This is not tested and not implemented.
+**Risk.**  **Low-Medium** (was Medium).  The worst case is a server that
+sends `* BYE` without closing the socket, which would still cause a hang
+until command timeout.  This is rare in practice.  A `* BYE` parser could
+reject pending commands immediately without waiting for socket close.
 
 ---
 
-## 7. Socket error mid-command
+## 7. Socket error mid-command ✅ FIXED (Batch 3a)
 
-**What is untested.**  If the underlying socket emits `"error"` while a
-command is pending (e.g. network failure), the `#reader` is never notified.
-The `ImapReader` does not listen for socket errors.  The pending command
-hangs until timeout.
+**What was untested.**  Socket `"close"` and `"error"` events were not
+propagated to pending promises.  Commands would hang until timeout (30 s).
 
-**Risk.**  **Medium-High.**  In production, a network blip causes a 30-second
-hang instead of an immediate rejection.  The old `imap-module` handled this
-by forwarding socket errors to the `ImapFetch` event emitter.
+**What changed.**  `#failAllPending(err)` rejects all outstanding
+`sendCommand` promises and resolves any in-flight `fetch()` when the
+socket closes or errors.  Wired into both implicit-TLS and STARTTLS
+upgrade paths.  Tested in `connection.test.ts` (socket error propagation).
+
+**Risk.**  Resolved.
 
 ---
 
@@ -117,13 +121,14 @@ by forwarding socket errors to the `ImapFetch` event emitter.
 **What is untested.**  IMAP allows pipelining — sending multiple commands
 before waiting for responses.  The `#pending` map supports multiple
 outstanding tags, and `#dispatchLine` dispatches by tag.  But no test sends
-two commands concurrently.
+two commands concurrently (other than CAPABILITY during `connect()`).
 
 **Risk.**  **Low for current usage.**  The project never pipelines commands
-(`server.ts` awaits each call).  A bug could surface if `fetchUnseen()`
-(which calls `search` then `fetch` sequentially) were changed to pipeline.
-The `#untagged` array is cleared in `sendCommand`, so pipelining would cause
-untagged responses from the first command to leak into the second.
+(`server.ts` awaits each call).  `fetch()` now throws if called concurrently
+(Batch 3a), which prevents the most dangerous overlap.  The `#untagged`
+array is cleared in `sendCommand`, so general-purpose pipelining would still
+cause untagged responses from one command to leak into another.  If
+pipelining is needed, `#untagged` should be keyed by tag in a `Map`.
 
 ---
 
@@ -188,25 +193,29 @@ implemented.  No risk assessment applies.
 
 ## Summary
 
-| # | Concern | Risk | Present in production? |
+| # | Concern | Risk | Status |
 |---|---|---|---|
-| 1 | STARTTLS happy path | Medium | No (uses implicit TLS) |
-| 2 | connTimeout on TLS | Low | Unlikely |
+| 1 | STARTTLS happy path | Medium | todo (needs TLS-capable mock) |
+| 2 | connTimeout on TLS | Low | Untested |
 | 3 | Per-command timeout | Low | Shared mechanism |
 | 4 | TLS options passthrough | Low | TypeScript-guarded |
-| 5 | PREAUTH greeting | **Medium** | No (KPN uses LOGIN) |
-| 6 | Untagged BYE mid-command | **Medium** | Possible, 30s hang |
-| 7 | Socket error mid-command | **Medium-High** | Possible, 30s hang |
-| 8 | Concurrent commands | Low | Not used |
+| 5 | PREAUTH greeting | **Medium** | Bug exists (sends unnecessary LOGIN) |
+| 6 | Untagged BYE mid-command | Low-Medium | Improved (Batch 3a), no BYE parser |
+| 7 | Socket error mid-command | — | ✅ Fixed (Batch 3a) |
+| 8 | Concurrent commands | Low | Guarded for fetch (Batch 3a) |
 | 9 | Multi-line CAPABILITY | Low | Rare |
 | 10 | Inline body fetch | Low | Rare |
 | 11 | Unsolicited MODSEQ/Gmail | Low | Not requested |
 | 12 | SEARCH with MODSEQ | **Medium** | Depends on server |
 
-**Overall judgement.**  The test suite provides good coverage of the
-happy-path polling loop (`connect` → `openBox` → `search` → `fetch` →
-`addFlags` → `close`).  The two highest-impact untested areas are **socket
-error handling mid-command** (items 6 and 7) and **CONDSTORE interference
-with SEARCH parsing** (item 12).  Both can cause silent hangs or incorrect
-results in production.  These should be prioritised before the module sees
-wider use.
+**Overall judgement (updated after Batch 3a).**  The test suite provides
+good coverage of the happy-path polling loop (`connect` → `openBox` →
+`search` → `fetch` → `addFlags` → `close`) plus connection robustness
+(timeouts, capability detection, STARTTLS gating).  The highest-impact
+remaining untested area is **CONDSTORE interference with SEARCH parsing**
+(item 12), which can return garbage UIDs if the server sends MODSEQ
+decorations.  **PREAUTH handling** (item 5) has a known bug where an
+unnecessary LOGIN is sent, which would cause `connect()` to fail on
+PREAUTH connections.  **STARTTLS happy path** (item 1) remains untestable
+without a TLS-capable mock server but is not exercised in production
+(KPN uses implicit TLS on port 993).

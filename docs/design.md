@@ -98,27 +98,31 @@ The new module uses UIDs exclusively.  If you need "the last message", do
 `search(["ALL"])` and take the last UID.  This keeps the API surface small
 and avoids the footgun of confusing UIDs with sequence numbers.
 
-## Push events — IDLE support (planned, Batch 3)
+## Push events — IDLE support (Batch 3, in progress)
 
 IDLE is the single most impactful missing feature: it enables real-time
 notification of new mail without polling.  A detailed race-condition analysis
-lives in `docs/idle-races.md`.  Five prerequisites must be addressed before
-IDLE can be implemented:
+lives in `docs/idle-races.md`.
 
-1. **`+` continuation handling** — `#dispatchLine` must detect `+` lines
-   (IMAP continuations) and route them to a dedicated callback.  IDLE and
-   APPEND both use continuations.
-2. **Socket error propagation** — a socket `"close"` or `"error"` during
-   IDLE must reject or yield a sentinel event rather than hanging forever.
-3. **`fetch()` concurrency guard** — concurrent `fetch()` calls overwrite
-   each other's internal state; a guard or per-tag state map is needed.
-4. **`#onLiteral` safety** — during IDLE, unsolicited FETCH responses with
-   body literals arrive with no `#fetchQueue` entry, causing data loss.
-5. **Post-DONE drain** — the IDLE iterator must continue yielding untagged
-   events after `DONE` is sent until the tagged OK arrives.
+**Batch 3a (prerequisites) is complete** — four of five blockers are done:
 
-Once these are addressed, the `idle()` method will return an
-`AsyncIterator<IdleEvent>` as described in the roadmap.
+1. ✅ **`+` continuation handling** — `ImapReader` detects `+` lines and
+   routes them to `onContinue`.  `Connection` exposes
+   `sendCommandWithContinuation()` for IDLE/APPEND.
+2. ✅ **Socket error propagation** — `#failAllPending()` rejects all
+   outstanding promises on socket `"close"` or `"error"`.  The mock server
+   destroys the socket on unexpected commands rather than throwing.
+3. ✅ **`fetch()` concurrency guard** — `fetch()` throws if another fetch
+   is already in-flight.
+4. ✅ **`#onLiteral` / `#handleFetchLine` safety** — `#handleFetchLine`
+   returns early when no `#fetchResolve` is set, preventing unsolicited
+   FETCH responses from leaking into fetch state.
+5. **Post-DONE drain** — deferred to the `idle()` implementation itself:
+   the iterator will continue yielding events after `DONE` is sent until
+   the tagged OK arrives.
+
+The `idle()` method will return an `AsyncIterator<IdleEvent>` as described
+in the roadmap.
 
 ## CAPABILITY negotiation
 
@@ -174,21 +178,20 @@ Charset detection and nested `OR` groups can be added when needed.
 - **Protocol errors** (tagged NO/BAD responses) reject the command promise
   with the server's error text.
 - **Timeouts** — `connTimeout`, `authTimeout`, and `commandTimeout` reject
-  with descriptive messages.  Auth timeout is tested; the shared timeout
-  mechanism covers all commands.
+  with descriptive messages.
+- **Socket close/error propagation** — when the socket closes or errors,
+  all outstanding `sendCommand` promises are rejected immediately via
+  `#failAllPending()`.  Added in Batch 3a (fixes `untested.md` #7 and
+  `idle-races.md` #10).
 - **Untagged BYE** is not yet handled — the socket will emit `"close"` but
   no promise is rejected.  The next command will fail.  Tracked as a
   medium-risk concern in `docs/untested.md` (#6).
-- **Socket errors mid-command** are not propagated to pending promises.
-  The command hangs until timeout (30 s default).  Tracked as a
-  medium-high risk concern in `docs/untested.md` (#7).  This must be
-  fixed before IDLE can be implemented (see `docs/idle-races.md` #10).
 - **`fetch()` never rejects** on protocol errors — if the server returns
   fewer results than requested, the caller gets what was returned.  This
   matches the old `node-imap` behaviour where non-existent UIDs silently
   produce no results.
-- **Concurrent `fetch()` calls** corrupt internal state (untested concern
-  #8, idle-races #7).  A guard should be added before IDLE.
+- **Concurrent `fetch()` calls** now throw rather than corrupting internal
+  state.  Added in Batch 3a (fixes `idle-races.md` #7).
 
 ## Module structure
 
@@ -198,13 +201,13 @@ vendored/imap-connector/
 ├── index.ts                barrel re-export
 ├── connection.ts           ImapReader (line/literal framing) + Connection (async API)
 ├── mock.ts                 scenario-based mock IMAP server
-├── connection.test.ts      33 unit tests + 2 todo (vitest, ~1s)
+├── connection.test.ts      37 unit tests + 2 todo (vitest, ~2.3s)
 ├── test-integration.ts     integration test against real server
 └── docs/
     ├── design.md           this file
     ├── roadmap.md          phased feature plan (batches 1-8)
     ├── untested.md         catalogue of untested behaviours with risk assessments
-    └── idle-races.md       race condition analysis for IDLE implementation
+    └── idle-races.md       race condition analysis for IDLE (prerequisites done)
 ```
 
 ## What the module is not

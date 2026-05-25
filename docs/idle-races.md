@@ -309,27 +309,25 @@ required for correctness.
 
 ## Summary
 
-| # | Race condition | Risk | Must-fix for IDLE? |
+| # | Race condition | Risk | Status |
 |---|---|---|---|
-| 1 | DONE before `+` arrives | Low | No (pipelining is fine) |
-| 2 | Events after DONE, before tagged OK | Medium | **Yes** — drain before return() |
-| 3 | Tag conflict between IDLE and next command | Low | No (tags are unique) |
-| 4 | `+` continuation not handled | **High** | **Yes** — must parse `+` |
-| 5 | Unsolicited untagged during non-IDLE | Low | No |
-| 6 | EXPUNGE during FETCH | Low | No |
-| 7 | Concurrent fetch overwrite | Medium | **Yes** — guard or key by tag |
-| 8 | IDLE updates lost when command clears #untagged | Low | No (#mailboxInfo is mutated in-place) |
-| 9 | Literal during IDLE with no fetchQueue | Medium | **Yes** — handle or ignore gracefully |
-| 10 | Socket close during IDLE | **High** | **Yes** — reject or yield sentinel |
+| 1 | DONE before `+` arrives | Low | No fix needed (pipelining is fine) |
+| 2 | Events after DONE, before tagged OK | Medium | **Deferred to IDLE impl** (post-DONE drain) |
+| 3 | Tag conflict between IDLE and next command | Low | No fix needed (tags are unique) |
+| 4 | `+` continuation not handled | — | ✅ **Fixed** (Batch 3a) — `onContinue` callback |
+| 5 | Unsolicited untagged during non-IDLE | Low | No fix needed |
+| 6 | EXPUNGE during FETCH | Low | No fix needed |
+| 7 | Concurrent fetch overwrite | — | ✅ **Fixed** (Batch 3a) — `fetch()` throws if in-flight |
+| 8 | IDLE updates lost when command clears #untagged | Low | No fix needed (#mailboxInfo is mutated in-place) |
+| 9 | Literal during IDLE with no fetchQueue | — | ✅ **Fixed** (Batch 3a) — `#handleFetchLine` guards on `#fetchResolve` |
+| 10 | Socket close during IDLE | — | ✅ **Fixed** (Batch 3a) — `#failAllPending` propagates to all promises |
 | 11 | watch() reconnect gap | Low | Nice-to-have |
 | 12 | DONE not sent on crash | Very low | Nice-to-have |
 
 **Prerequisites before implementing IDLE:**
 
-1. Add `+` continuation handling to `#dispatchLine` (race #4).
-2. Add socket `"close"` / `"error"` propagation to reject pending promises
-   (race #10, also fixes untested concern #7 from `untested.md`).
-3. Guard `fetch()` against concurrent calls (race #7).
-4. Make `#onLiteral` safe when `#fetchQueue` is empty (race #9).
-5. Design the IDLE iterator to drain untagged lines after DONE until tagged
-   OK (race #2).
+1. ✅ `+` continuation handling — `ImapReader.onContinue` + `Connection.sendCommandWithContinuation()` (race #4).
+2. ✅ Socket `"close"` / `"error"` propagation — `#failAllPending()` rejects all outstanding promises (race #10, also fixes `untested.md` #7).
+3. ✅ Guard `fetch()` against concurrent calls — throws if `#fetchResolve` is already set (race #7).
+4. ✅ Make `#onLiteral` / `#handleFetchLine` safe — `#handleFetchLine` returns early when no fetch is in progress (race #9).
+5. **Post-DONE drain** — the IDLE iterator must continue yielding untagged lines after `DONE` is sent until the tagged OK arrives (race #2).  This is the sole remaining blocker and will be addressed during the `idle()` implementation itself (Batch 3b).
