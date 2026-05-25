@@ -865,4 +865,73 @@ describe("idle", () => {
     expect(events[0]).toMatchObject({ type: "recent", count: 2 });
     server.close();
   });
+
+  it("exits cleanly when socket closes during idle", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ IDLE$/,
+        respond: "+ idling",
+      },
+    ]);
+
+    const events: unknown[] = [];
+    const idlePromise = (async () => {
+      for await (const ev of conn.idle()) {
+        events.push(ev);
+      }
+    })();
+
+    // Let idle enter, then kill the socket.
+    await new Promise((r) => setTimeout(r, 50));
+    server.close();
+
+    // The for-await loop should exit without throwing.
+    await idlePromise;
+
+    expect(events).toHaveLength(0);
+  });
+
+  it("sendCommand rejects immediately after socket close during idle", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ IDLE$/,
+        respond: "+ idling",
+      },
+    ]);
+
+    const idlePromise = (async () => {
+      for await (const _ of conn.idle()) { void _; }
+    })();
+
+    // Let idle enter, then kill the socket.
+    await new Promise((r) => setTimeout(r, 50));
+    server.close();
+    await idlePromise;
+
+    // Connection is now dead — sendCommand should reject immediately.
+    await expect(conn.search(["ALL"])).rejects.toThrow("Connection is dead");
+  });
+
+  it("close() is a no-op after socket close during idle", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ IDLE$/,
+        respond: "+ idling",
+      },
+    ]);
+
+    const idlePromise = (async () => {
+      for await (const _ of conn.idle()) { void _; }
+    })();
+
+    await new Promise((r) => setTimeout(r, 50));
+    server.close();
+    await idlePromise;
+
+    // Should not throw or hang — returns immediately.
+    await conn.close();
+  });
 });

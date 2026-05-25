@@ -124,12 +124,21 @@ race-condition analysis (`docs/idle-races.md`):
   arrive from the server.
 - On `break` / `return()`: sends `DONE`, drains remaining untagged events
   until the tagged OK arrives, then resolves.
+- On socket close during IDLE: the `#failAllPending` path marks the
+  connection as dead (`#dead = true`, `#reader = null`, `#idleHook = null`),
+  the IDLE loop exits cleanly, and subsequent `sendCommand` calls reject
+  immediately with `"Connection is dead"` instead of hanging on the 30 s
+  command timeout.
 - Throws if the server lacks the `IDLE` capability.
 - Uses an `#idleHook` callback in `#dispatchLine` rather than overriding
   the private method (which is not assignable in JavaScript).
+- Protocol-level debug logging is built in: `ImapConfig.debug` enables it
+  at construction, `conn.setDebug(bool)` toggles at runtime.  Every socket
+  read/write and every dispatched line is logged to stderr with timestamps.
 
 The `watch()` convenience method (auto-reconnecting IDLE loop) is deferred
-to a future batch.
+to a future batch.  The `tools/watchInbox.ts` script demonstrates a simple
+reconnection loop on top of `idle()`.
 
 ## CAPABILITY negotiation
 
@@ -187,9 +196,12 @@ Charset detection and nested `OR` groups can be added when needed.
 - **Timeouts** — `connTimeout`, `authTimeout`, and `commandTimeout` reject
   with descriptive messages.
 - **Socket close/error propagation** — when the socket closes or errors,
-  all outstanding `sendCommand` promises are rejected immediately via
-  `#failAllPending()`.  Added in Batch 3a (fixes `untested.md` #7 and
-  `idle-races.md` #10).
+  `#failAllPending()` marks the connection dead (`#dead = true`), nulls
+  `#reader`, and rejects all outstanding `sendCommand` promises.  Any
+  subsequent `sendCommand` call rejects immediately with `"Connection is
+  dead"` rather than hanging on the 30 s timeout.  `close()` returns
+  immediately on a dead connection.  Added in Batch 3a/3b (fixes
+  `untested.md` #7 and `idle-races.md` #10).
 - **Untagged BYE** is not yet handled — the socket will emit `"close"` but
   no promise is rejected.  The next command will fail.  Tracked as a
   medium-risk concern in `docs/untested.md` (#6).
@@ -208,13 +220,13 @@ vendored/imap-connector/
 ├── index.ts                barrel re-export
 ├── connection.ts           ImapReader (line/literal framing) + Connection (async API)
 ├── mock.ts                 scenario-based mock IMAP server
-├── connection.test.ts      43 unit tests + 2 todo (vitest, ~2.5s)
+├── connection.test.ts      46 unit tests + 2 todo (vitest, ~2.5s)
 ├── test-integration.ts     integration test against real server
 └── docs/
     ├── design.md           this file
     ├── roadmap.md          phased feature plan (batches 1-8)
     ├── untested.md         catalogue of untested behaviours with risk assessments
-    ├── idle-races.md       race condition analysis for IDLE
+    └── idle-races.md       race condition analysis for IDLE
 ```
 
 ## What the module is not

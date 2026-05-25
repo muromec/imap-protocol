@@ -11,7 +11,7 @@ dependencies, promise-based API, no streaming parser unless necessary.
 | 1 | Test infrastructure + existing API | ✅ Complete | 25 + 1 todo |
 | 2 | Connection robustness | ✅ Complete | 33 + 2 todo |
 | 3a | IDLE prerequisites | ✅ Complete | 37 + 2 todo |
-| 3b | IDLE implementation | ✅ Complete | 43 + 2 todo |
+| 3b | IDLE implementation + dead-connection guard | ✅ Complete | 46 + 2 todo |
 | 4 | Mailbox management | Not started | — |
 | 5 | Message mutation | Not started | — |
 | 6 | Richer fetch | Not started | — |
@@ -187,6 +187,9 @@ Mock server (`mock.ts`) supports `+` continuations and `DONE` detection.
 | Yields FETCH flags-change event (UID, FLAGS parsed) | ✅ |
 | Yields RECENT event | ✅ |
 | Post-DONE drain: events after DONE before tagged OK are yielded | ✅ |
+| IDLE loop exits cleanly when socket closes | ✅ |
+| `sendCommand` rejects immediately with `"Connection is dead"` after socket close | ✅ |
+| `close()` returns immediately on a dead connection | ✅ |
 
 ### Deferred
 
