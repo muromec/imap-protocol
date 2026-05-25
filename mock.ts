@@ -94,7 +94,8 @@ export class MockImapServer {
 
   /** Shut down the server and close any open socket. */
   close(): void {
-    this.#socket?.destroy();
+    this.#rejectScenario = null;
+    this.#socket?.end();
     this.#server.close();
   }
 
@@ -201,11 +202,10 @@ export class MockImapServer {
 
     if (this.#step >= this.#scenario.length) {
       if (!this.#options.allowExtra) {
-        const err = new Error(
-          `Unexpected command after scenario finished: ${cmd}`,
+        this.#rejectScenario = null;
+        this.#socket?.destroy(
+          new Error(`Unexpected command after scenario finished: ${cmd}`),
         );
-        this.#rejectScenario?.(err);
-        this.#socket?.destroy(err);
         return;
       }
       // auto-respond with a tagged OK so the client's sendCommand resolves
@@ -219,13 +219,14 @@ export class MockImapServer {
     const step = this.#scenario[this.#step];
     if (!step.expect.test(cmd.trim())) {
       if (!this.#options.allowExtra) {
-        const err = new Error(
-          `Command mismatch at step ${this.#step}:\n` +
-            `  expected: ${step.expect}\n` +
-            `  got:      ${cmd}`,
+        this.#rejectScenario = null;
+        this.#socket?.destroy(
+          new Error(
+            `Command mismatch at step ${this.#step}:\n` +
+              `  expected: ${step.expect}\n` +
+              `  got:      ${cmd}`,
+          ),
         );
-        this.#rejectScenario?.(err);
-        this.#socket?.destroy(err);
         return;
       }
       // auto-respond with a tagged OK so the client's sendCommand resolves

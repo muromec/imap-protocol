@@ -1,5 +1,7 @@
 import tls from "node:tls";
 import { Socket } from "node:net";
+import { Transport } from "./transport.ts";
+import { CommandDispatcher } from "./dispatch.ts";
 
 // ── types ──────────────────────────────────────────────────────────────────
 
@@ -80,148 +82,18 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
  * Lines starting with `+` are IMAP continuations and are routed to
  * `onContinue` rather than `onLine`.
  */
-function debugSocket(socket: Socket, prefix: string, onWrite: (raw: string) => void): Socket {
-  const origWrite = socket.write.bind(socket);
-  socket.write = function (data: string | Buffer, ...rest: any[]) {
-    onWrite(typeof data === "string" ? data : data.toString("utf8"));
-    return origWrite(data, ...rest);
-  } as typeof socket.write;
-  return socket;
-}
-
-class ImapReader {
-  #socket: Socket;
-  #buf = "";
-  #literalRemaining = 0;
-  #literalChunks: string[] = [];
-  #lineCallback: ((line: string) => void) | null = null;
-  #literalCallback: ((data: string) => void) | null = null;
-  #continueCallback: ((line: string) => void) | null = null;
-  #onRawRead: ((raw: string) => void) | null = null;
-
-  constructor(socket: Socket) {
-    this.#socket = socket;
-    socket.on("data", (chunk: Buffer) => {
-      const raw = chunk.toString("utf8");
-      this.#onRawRead?.(raw);
-      this.#onData(raw);
-    });
-  }
-
-  /** Set a callback for raw socket reads (debug logging). */
-  onRawRead(cb: ((raw: string) => void) | null): void {
-    this.#onRawRead = cb;
-  }
-
-  onLine(cb: (line: string) => void): void {
-    this.#lineCallback = cb;
-  }
-
-  onLiteral(cb: (data: string) => void): void {
-    this.#literalCallback = cb;
-  }
-
-  /** Callback for IMAP continuation lines (starting with `+`). */
-  onContinue(cb: (line: string) => void): void {
-    this.#continueCallback = cb;
-  }
-
-  /**
-   * Feed a literal that we already know the size of (from a fetch line).
-   * The next `size` bytes from the socket will be delivered to the
-   * literal callback instead of the line callback.
-   */
-  expectLiteral(size: number): void {
-    this.#literalRemaining = size;
-    this.#literalChunks = [];
-  }
-
-  // ── internals ──────────────────────────────────────────────────────────
-
-  #onData(raw: string): void {
-    this.#buf += raw;
-    this.#drain();
-  }
-
-  #drain(): void {
-    while (true) {
-      if (this.#literalRemaining > 0) {
-        // we are inside a literal — consume bytes
-        if (this.#buf.length === 0) return;
-        const take = Math.min(this.#literalRemaining, this.#buf.length);
-        this.#literalChunks.push(this.#buf.slice(0, take));
-        this.#literalRemaining -= take;
-        this.#buf = this.#buf.slice(take);
-
-        if (this.#literalRemaining === 0) {
-          // literal complete — emit it then go back to line mode
-          const data = this.#literalChunks.join("");
-          this.#literalChunks = [];
-          this.#literalCallback?.(data);
-          // literal is followed by CRLF — consume it
-          if (this.#buf.startsWith(CRLF)) {
-            this.#buf = this.#buf.slice(2);
-          }
-          continue; // resume line processing
-        }
-        return;
-      }
-
-      // line mode — find next CRLF
-      const idx = this.#buf.indexOf(CRLF);
-      if (idx === -1) return; // incomplete line, wait for more data
-
-      const line = this.#buf.slice(0, idx);
-      this.#buf = this.#buf.slice(idx + 2);
-
-      if (!line) continue; // skip empty lines
-
-      // IMAP continuation lines: + optional-text
-      if (line.startsWith("+")) {
-        this.#continueCallback?.(line);
-        continue;
-      }
-
-      // check for trailing literal marker on this line: ... {size}
-      const litMatch = line.match(/\{(\d+)\}$/);
-      if (litMatch) {
-        this.#lineCallback?.(line);
-        this.expectLiteral(Number(litMatch[1]));
-        continue;
-      }
-
-      this.#lineCallback?.(line);
-    }
-  }
-
-  /** Send a command (no tag, just the raw command). */
-  send(cmd: string): void {
-    this.#socket.write(cmd + CRLF, "utf8");
-  }
-
-  close(): void {
-    this.#socket.end();
-  }
-}
-
 // ── connection ──────────────────────────────────────────────────────────────
 
 export class Connection {
   #config: ImapConfig;
-  #reader: ImapReader | null = null;
+  #transport: Transport | null = null;
+  #dispatcher: CommandDispatcher | null = null;
   #debugEnabled: boolean;
-  #dead = false;
 
   constructor(config: ImapConfig) {
     this.#config = config;
     this.#debugEnabled = config.debug ?? false;
   }
-  #tag = 0;
-  #pending = new Map<
-    string,
-    { resolve: (lines: string[]) => void; reject: (e: Error) => void; timer?: ReturnType<typeof setTimeout> }
-  >();
-  #untagged: string[] = [];
   #mailboxInfo: MailboxInfo | null = null;
 
   /** Server capabilities discovered after LOGIN. */
@@ -235,7 +107,7 @@ export class Connection {
   // continuation callback for IDLE/APPEND (+ lines)
   #continuationResolve: ((line: string) => void) | null = null;
 
-  // idle event hook — called from #dispatchLine for every untagged line
+  // idle event hook — called from dispatcher for every untagged line
   // during an active IDLE session.  Null when not idling.
   #idleHook: ((line: string) => void) | null = null;
 
@@ -248,7 +120,7 @@ export class Connection {
 
   /** Whether the connection has been closed or has errored out. */
   get dead(): boolean {
-    return this.#dead;
+    return this.#dispatcher?.dead ?? true;
   }
 
   /**
@@ -258,6 +130,7 @@ export class Connection {
    */
   setDebug(enabled: boolean): void {
     this.#debugEnabled = enabled;
+    this.#transport?.setDebug(enabled);
   }
 
   #debug(kind: string, ...args: unknown[]): void {
@@ -275,45 +148,62 @@ export class Connection {
     return this.capabilities.has(cap.toUpperCase());
   }
 
-  // ── protocol helpers ───────────────────────────────────────────────────
-
-  #nextTag(): string {
-    return "A" + String(++this.#tag).padStart(4, "0");
-  }
+  // ── protocol helpers (delegate to dispatcher) ─────────────────────────
 
   sendCommand(cmd: string): Promise<string[]> {
-    if (this.#dead) return Promise.reject(new Error("Connection is dead"));
-    const tag = this.#nextTag();
-    const timeout = this.#config.commandTimeout ?? 30_000;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.#pending.delete(tag);
-        this.#reader?.close();
-        reject(new Error(`Command timed out: ${cmd.slice(0, 50)}`));
-      }, timeout);
-      this.#pending.set(tag, { resolve, reject, timer });
-      this.#untagged = [];
-      this.#reader!.send(tag + " " + cmd);
+    return this.#dispatcher!.sendCommand(cmd);
+  }
+
+  sendCommandWithContinuation(cmd: string): Promise<string> {
+    return new Promise((resolve) => {
+      this.#continuationResolve = resolve;
+      this.#transport!.send(cmd);
     });
   }
 
-  // ── socket error propagation ───────────────────────────────────────────
+  // ── session-level untagged handler ────────────────────────────────────
 
-  #failAllPending(err: Error): void {
-    this.#dead = true;
-    this.#reader = null;
-    this.#idleHook = null;
-    for (const [tag, p] of this.#pending) {
-      clearTimeout(p.timer);
-      p.reject(err);
-    }
-    this.#pending.clear();
-    if (this.#fetchResolve) {
-      const r = this.#fetchResolve;
-      this.#fetchResolve = null;
-      this.#fetchQueue = null;
-      r(this.#fetchResults);
-    }
+  #sessionUntagged(line: string): void {
+    this.#debug("line", line);
+
+    // Idle hook consumes all lines (tagged and untagged) when active.
+    if (this.#idleHook) this.#idleHook(line);
+
+    this.#handleUntagged(line);
+    this.#handleFetchLine(line);
+  }
+
+  // ── dispatcher wiring ─────────────────────────────────────────────────
+
+  #wireDispatcher(): void {
+    this.#dispatcher = new CommandDispatcher(
+      this.#transport!,
+      this.#config.commandTimeout ?? 30_000,
+    );
+
+    // Route untagged lines through the session handler.
+    this.#dispatcher.onUntagged((line) => {
+      this.#sessionUntagged(line);
+    });
+
+    // Transport death → cleanup session-level state.
+    this.#dispatcher.onDead(() => {
+      if (this.#idleEventResolve) {
+        this.#idleEventResolve(null);
+        this.#idleEventResolve = null;
+      }
+      if (this.#idleDrainResolve) {
+        this.#idleDrainResolve();
+        this.#idleDrainResolve = null;
+      }
+      this.#idleHook = null;
+      if (this.#fetchResolve) {
+        const r = this.#fetchResolve;
+        this.#fetchResolve = null;
+        this.#fetchQueue = null;
+        r(this.#fetchResults);
+      }
+    });
   }
 
   // ── connect / close ────────────────────────────────────────────────────
@@ -336,32 +226,11 @@ export class Connection {
 
       const onReady = (socket: Socket) => {
         clearTimeout(connTimer);
-        // Debug: wrap socket writes and raw reads.
-        if (this.#debugEnabled) {
-          debugSocket(socket, "", (raw) => this.#debug("→", raw));
-        }
-        this.#reader = new ImapReader(socket);
-        this.#reader.onLine((line) => this.#dispatchLine(line));
-        this.#reader.onLiteral((data) => this.#onLiteral(data));
-        this.#reader.onContinue((line) => this.#onContinue(line));
-        this.#reader.onRawRead((raw) => { if (this.#debugEnabled) this.#debug("←", JSON.stringify(raw)); });
-
-        // Propagate socket-level failures to all pending commands.
-        socket.on("close", () => {
-            this.#debug("socket", "closed");
-            if (this.#idleEventResolve) {
-              this.#idleEventResolve(null);
-              this.#idleEventResolve = null;
-            }
-            if (this.#idleDrainResolve) {
-              this.#idleDrainResolve();
-              this.#idleDrainResolve = null;
-            }
-            this.#failAllPending(new Error("Socket closed"));
-        });
-        socket.on("error", (e: Error) => {
-          this.#failAllPending(e);
-        });
+        this.#transport = new Transport(socket, this.#debugEnabled);
+        this.#transport.onLiteral((data) => this.#onLiteral(data));
+        this.#transport.onContinue((line) => this.#onContinue(line));
+        this.#transport.onRawRead((raw) => { if (this.#debugEnabled) this.#debug("←", JSON.stringify(raw)); });
+        this.#wireDispatcher();
 
         let starttlsDone = false;
 
@@ -395,8 +264,12 @@ export class Connection {
             .catch((e) => settle(() => reject(e)));
         };
 
+        let greeted = false;
+
         const onGreeting = (line: string) => {
+          if (greeted) return;
           if (!line.startsWith("* OK") && !line.startsWith("* PREAUTH")) return;
+          greeted = true;
 
           // check for STARTTLS in greeting capabilities
           const greetCaps = line.match(/CAPABILITY (.*)/i);
@@ -414,7 +287,7 @@ export class Connection {
 
           if (canStarttls && wantStarttls && !starttlsDone) {
             starttlsDone = true;
-            this.#reader!.onLine((l) => this.#dispatchLine(l));
+            this.#dispatcher = null;
             this.sendCommand("STARTTLS").then(() => {
               const rawSocket = socket;
               const tlsSocket = tls.connect({
@@ -422,45 +295,31 @@ export class Connection {
                 host: this.#config.host,
                 ...this.#config.tlsOptions,
               });
-              this.#reader = new ImapReader(tlsSocket);
-              this.#reader.onLine((line2) => this.#dispatchLine(line2));
-              this.#reader.onLiteral((data) => this.#onLiteral(data));
-              this.#reader.onContinue((line) => this.#onContinue(line));
-              this.#reader.onRawRead((raw) => { if (this.#debugEnabled) this.#debug("←", JSON.stringify(raw)); });
-              tlsSocket.on("close", () => {
-                this.#debug("socket", "closed (TLS upgrade)");
-                if (this.#idleEventResolve) {
-                  this.#idleEventResolve(null);
-                  this.#idleEventResolve = null;
-                }
-                if (this.#idleDrainResolve) {
-                  this.#idleDrainResolve();
-                  this.#idleDrainResolve = null;
-                }
-                this.#failAllPending(new Error("Socket closed"));
-              });
-              tlsSocket.on("error", (e: Error) => {
-                if (this.#idleEventResolve) {
-                  this.#idleEventResolve(null);
-                  this.#idleEventResolve = null;
-                }
-                if (this.#idleDrainResolve) {
-                  this.#idleDrainResolve();
-                  this.#idleDrainResolve = null;
-                }
-                this.#failAllPending(e);
-              });
+              this.#transport = new Transport(tlsSocket, this.#debugEnabled);
+              this.#transport.onLiteral((data) => this.#onLiteral(data));
+              this.#transport.onContinue((line) => this.#onContinue(line));
+              this.#transport.onRawRead((raw) => { if (this.#debugEnabled) this.#debug("←", JSON.stringify(raw)); });
+              this.#wireDispatcher();
               doLogin();
             }).catch((e) => settle(() => reject(e)));
             return;
           }
 
           // no STARTTLS — proceed to login
-          this.#reader!.onLine((l) => this.#dispatchLine(l));
           doLogin();
         };
 
-        this.#reader.onLine(onGreeting);
+        // Use the dispatcher's untagged callback to detect the greeting.
+        // The dispatcher owns transport.onLine, so we route through
+        // the session-level handler temporarily.
+        const untaggedHandler = this.#dispatcher!.onUntagged;
+        const origUntagged = this.#sessionUntagged.bind(this);
+        this.#dispatcher!.onUntagged((line) => {
+          // Dispatch to greeting handler first.
+          onGreeting(line);
+          // Then to the normal session handler.
+          origUntagged(line);
+        });
       };
 
       let socket: Socket;
@@ -481,15 +340,15 @@ export class Connection {
   }
 
   async close(): Promise<void> {
-    if (this.#dead) return;
+    if (this.dead) return;
     try {
       await this.sendCommand("LOGOUT");
     } catch {
       // LOGOUT may fail; close the socket regardless.
     } finally {
-      this.#reader?.close();
-      this.#reader = null;
-      this.#dead = true;
+      this.#transport?.close();
+      this.#transport = null;
+      this.#dispatcher = null;
     }
   }
 
@@ -502,54 +361,6 @@ export class Connection {
       this.#continuationResolve = null;
       r(line);
     }
-  }
-
-  /**
-   * Send a command that expects a `+` continuation before the tagged
-   * response.  Returns a promise that resolves with the continuation
-   * line.  The caller is responsible for sending the subsequent command
-   * and waiting for the tagged response via sendCommand.
-   */
-  sendCommandWithContinuation(cmd: string): Promise<string> {
-    return new Promise((resolve) => {
-      this.#continuationResolve = resolve;
-      this.#reader!.send(cmd);
-    });
-  }
-
-  // ── line dispatch ──────────────────────────────────────────────────────
-
-  #dispatchLine(line: string): void {
-    this.#debug("line", line);
-    const tagged = line.match(RE_TAGGED);
-    if (tagged) {
-      // Let the idle hook see the tagged response — it may be the OK for
-      // the IDLE command, which signals the end of the drain phase.
-      if (this.#idleHook) this.#idleHook(line);
-
-      const [, tag, status] = tagged;
-      const p = this.#pending.get(tag);
-      if (!p) return;
-      this.#pending.delete(tag);
-      clearTimeout(p.timer);
-
-      if (status === "OK") {
-        p.resolve([...this.#untagged]);
-      } else {
-        p.reject(new Error(status + ": " + line));
-      }
-      return;
-    }
-
-    // Idle hook consumes untagged lines when active.
-    if (this.#idleHook) {
-      this.#idleHook(line);
-    }
-
-    // untagged
-    this.#untagged.push(line);
-    this.#handleUntagged(line);
-    this.#handleFetchLine(line);
   }
 
   // ── untagged status updates ────────────────────────────────────────────
@@ -780,16 +591,13 @@ export class Connection {
       throw new Error("Server does not support IDLE");
     }
 
-    // Tag for this IDLE session.
-    this.#idleTag = this.#nextTag();
-    const timer = setTimeout(() => {
-      this.#pending.delete(this.#idleTag);
-      this.#reader?.close();
+    // Tag for this IDLE session.  We do NOT register it in the
+    // dispatcher's pending map — that would cause the dispatcher to
+    // consume the tagged OK instead of forwarding it to the idle hook.
+    this.#idleTag = this.#dispatcher!.nextTag();
+    const idleTimer = setTimeout(() => {
+      this.#transport?.close();
     }, this.#config.commandTimeout ?? 30_000);
-    this.#pending.set(this.#idleTag, {
-      resolve: () => {}, reject: () => {}, timer,
-    });
-    this.#untagged = [];
 
     // Install the idle hook BEFORE sending the command so we catch
     // events that arrive synchronously with the server response.
@@ -814,7 +622,7 @@ export class Connection {
       const tagged = line.match(RE_TAGGED);
       if (tagged) {
         if (tagged[1] === idleTag) {
-          // Tagged OK for our IDLE command — end of drain.
+          clearTimeout(idleTimer);
           this.#idleHook = null;
           if (drainResolve) drainResolve();
         }
@@ -824,25 +632,35 @@ export class Connection {
       if (ev) pushIdleEvent(ev);
     };
 
+    // Set eventResolve BEFORE sending IDLE so we catch events that
+    // arrive synchronously with the continuation response.
+    let firstEventPromise = new Promise<IdleEvent | null>((resolve) => {
+      eventResolve = resolve;
+      this.#idleEventResolve = resolve;
+    });
+
     // Send IDLE and wait for continuation.
     const continuationPromise: Promise<string> = new Promise((resolve) => {
       this.#continuationResolve = resolve;
     });
-    this.#reader!.send(this.#idleTag + " IDLE");
+    this.#transport!.send(this.#idleTag + " IDLE");
 
     const contLine = await continuationPromise;
     if (!contLine.startsWith("+")) {
       this.#idleHook = null;
+      this.#idleEventResolve = null;
       throw new Error(`Expected continuation, got: ${contLine}`);
     }
 
     // Yield events as they arrive.
     try {
+      let first = true;
       while (!done) {
-        const event = await new Promise<IdleEvent | null>((resolve) => {
+        const event = await (first ? firstEventPromise : new Promise<IdleEvent | null>((resolve) => {
           eventResolve = resolve;
           this.#idleEventResolve = resolve;
-        });
+        }));
+        first = false;
         if (event === null) break;
         yield event;
       }
@@ -851,19 +669,23 @@ export class Connection {
 
       // If the socket is already closed, skip DONE/drain — there's
       // nothing to send to and the tagged OK will never arrive.
-      if (this.#idleHook != null) {
+      if (this.#idleHook != null && this.#transport != null) {
         // Send DONE
-        this.#reader!.send("DONE");
+        try {
+          this.#transport.send("DONE");
 
-        // Drain: wait for tagged OK for IDLE
-        await new Promise<void>((resolve) => {
-          drainResolve = resolve;
-          this.#idleDrainResolve = resolve;
-        });
+          // Drain: wait for tagged OK for IDLE
+          await new Promise<void>((resolve) => {
+            drainResolve = resolve;
+            this.#idleDrainResolve = resolve;
+          });
 
-        // Yield any events that arrived after DONE but before tagged OK.
-        for (const ev of eventQueue) {
-          yield ev;
+          // Yield any events that arrived after DONE but before tagged OK.
+          for (const ev of eventQueue) {
+            yield ev;
+          }
+        } catch (err) {
+          console.error(new Error("Unhandled error in idle finally", { cause: err }));
         }
       }
 

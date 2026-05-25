@@ -634,6 +634,7 @@ describe("fetch concurrency", () => {
     expect(() => conn.fetch([2])).toThrow(
       "A fetch is already in progress",
     );
+    await conn.close();
     server.close();
   });
 });
@@ -650,17 +651,15 @@ describe("continuations", () => {
     // the method exists and doesn't crash.
     const conn = await connectAndLogin(server, []);
 
-    // sendCommandWithContinuation is exposed.  Sending a command
-    // that the mock doesn't handle means allowExtra auto-responds
-    // with a tagged OK, which goes to #dispatchLine, not
-    // #onContinue.  So the continuation promise hangs.
-    // We just verify the method is callable.
-    const contPromise = conn.sendCommandWithContinuation("IDLE");
+    // sendCommandWithContinuation sends a raw command and returns
+    // a promise for the + continuation.  Use a tagged command so
+    // the mock auto-responds cleanly rather than leaving a dangling
+    // socket that causes ECONNRESET during cleanup.
+    const contPromise = conn.sendCommandWithContinuation("A0003 IDLE");
     expect(contPromise).toBeInstanceOf(Promise);
 
-    // Clean up: close the connection to reject the hanging promise.
-    conn.close().catch(() => {});
-    server.close();
+    // Clean up: close the connection, which resolves LOGOUT cleanly.
+    await conn.close();
   });
 });
 
