@@ -1,4 +1,5 @@
-import { Connection, type IdleEvent, type FetchedMessage } from "./connection.ts";
+import { Connection } from "./connection.ts";
+import { type IdleEvent, type FetchedMessage } from "./interface.ts";
 
 // ── types ──────────────────────────────────────────────────────────────────
 
