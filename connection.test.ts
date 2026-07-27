@@ -244,6 +244,19 @@ describe("search", () => {
     expect(uids).toEqual([]);
   });
 
+  it("ignores a trailing MODSEQ decoration in SEARCH results", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ UID SEARCH UNSEEN$/,
+        respond: "* SEARCH 1 2 3 (MODSEQ 456)",
+      },
+    ]);
+
+    const uids = await conn.search(["UNSEEN"]);
+    expect(uids).toEqual([1, 2, 3]);
+  });
+
   it("builds criteria with nested arrays", async () => {
     const server = await newServer();
     const conn = await connectAndLogin(server, [

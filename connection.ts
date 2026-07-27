@@ -340,6 +340,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
       const m = line.match(RE_SEARCH);
       if (m) {
         return m[1]
+          .replace(/\s*\(MODSEQ \d+\)\s*$/i, "")
           .trim()
           .split(/\s+/)
           .filter(Boolean)
