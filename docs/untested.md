@@ -72,33 +72,26 @@ catch (unknown properties on `ConnectionOptions`).
 
 ---
 
-## 5. PREAUTH greeting
+## 5. PREAUTH greeting ✅ FIXED
 
-**What is untested.**  If the server sends `* PREAUTH` instead of `* OK`,
-the client skips LOGIN.  The code handles this (`line.startsWith("* PREAUTH")`
-in `onGreeting`), but no test covers it.  With PREAUTH, `doLogin()` is still
-called, which sends a LOGIN command that the server may reject.
+**What changed.** Greeting detection now reports whether the server sent
+`* PREAUTH`. `connect()` skips LOGIN in that case and proceeds to
+CAPABILITY discovery. A mock-server test verifies that LOGIN is not sent.
 
-**Risk.**  **Medium.**  On a PREAUTH connection, the client sends an
-unnecessary LOGIN.  Most servers will reject it with `NO` or `BAD`, causing
-`connect()` to reject.  The fix would be to skip LOGIN on PREAUTH and
-resolve immediately.  This bug exists in the current code.
+**Remaining risk.** **Low.** STARTTLS after PREAUTH is not a meaningful
+combination in the current handshake and remains outside the test matrix.
 
 ---
 
-## 6. Untagged BYE during a command
+## 6. Untagged BYE during a command ✅ FIXED
 
-**What is untested.**  If the server sends `* BYE` while a command is
-pending, the socket eventually closes.  The client now rejects pending
-commands immediately when the socket closes (via `#failAllPending`, added
-in Batch 3a), so the hang is at most the TCP round-trip time after the
-server sends BYE and closes the connection.  However, the client does not
-parse the `* BYE` line itself — it relies on the subsequent socket close.
+**What changed.** The dispatcher recognizes an untagged `* BYE`, forwards
+the line to the session callback, marks the connection dead, and rejects
+all pending commands with the BYE text. A mock-server regression test
+covers a BYE without waiting for the socket to close.
 
-**Risk.**  **Low-Medium** (was Medium).  The worst case is a server that
-sends `* BYE` without closing the socket, which would still cause a hang
-until command timeout.  This is rare in practice.  A `* BYE` parser could
-reject pending commands immediately without waiting for socket close.
+**Remaining risk.** **Low.** The server may leave the TCP socket open, but
+the dispatcher rejects new commands immediately after it becomes dead.
 
 ---
 
@@ -171,16 +164,14 @@ appear after `FLAGS` and before `BODY[]`, potentially breaking the regex.
 
 ---
 
-## 12. `search()` with SEARCH response that has MODSEQ
+## 12. `search()` with SEARCH response that has MODSEQ ✅ FIXED
 
-**What is untested.**  `CONDSTORE` servers append `(MODSEQ 123)` to SEARCH
-results: `* SEARCH 1 2 3 (MODSEQ 456)`.  The current regex `RE_SEARCH`
-captures `1 2 3 (MODSEQ 456)` and `split(/\s+/)` would include `(MODSEQ`
-and `456)` as "UIDs", causing `parseInt` to return `NaN`.
+**What changed.** `search()` strips a trailing `(MODSEQ number)`
+decoration before parsing UID tokens. A mock-server test covers the
+decorated response.
 
-**Risk.**  **Medium.**  If the production server enables CONDSTORE, search
-results will contain garbage UIDs and `fetchUnseen()` will fail silently
-(fetching non-existent UIDs returns empty results).
+**Remaining risk.** **Low.** ESEARCH and other response forms remain
+separate protocol features rather than being accepted by this parser.
 
 ---
 
@@ -199,23 +190,19 @@ implemented.  No risk assessment applies.
 | 2 | connTimeout on TLS | Low | Untested |
 | 3 | Per-command timeout | Low | Shared mechanism |
 | 4 | TLS options passthrough | Low | TypeScript-guarded |
-| 5 | PREAUTH greeting | **Medium** | Bug exists (sends unnecessary LOGIN) |
-| 6 | Untagged BYE mid-command | Low-Medium | Improved (Batch 3a), no BYE parser |
+| 5 | PREAUTH greeting | Low | ✅ Fixed and tested |
+| 6 | Untagged BYE mid-command | Low | ✅ Fixed and tested |
 | 7 | Socket error mid-command | — | ✅ Fixed (Batch 3a) |
 | 8 | Concurrent commands | Low | Guarded for fetch (Batch 3a) |
 | 9 | Multi-line CAPABILITY | Low | Rare |
 | 10 | Inline body fetch | Low | Rare |
 | 11 | Unsolicited MODSEQ/Gmail | Low | Not requested |
-| 12 | SEARCH with MODSEQ | **Medium** | Depends on server |
+| 12 | SEARCH with MODSEQ | Low | ✅ Fixed and tested |
 
-**Overall judgement (updated after Batch 3a).**  The test suite provides
+**Overall judgement.**  The test suite provides
 good coverage of the happy-path polling loop (`connect` → `openBox` →
 `search` → `fetch` → `addFlags` → `close`) plus connection robustness
-(timeouts, capability detection, STARTTLS gating).  The highest-impact
-remaining untested area is **CONDSTORE interference with SEARCH parsing**
-(item 12), which can return garbage UIDs if the server sends MODSEQ
-decorations.  **PREAUTH handling** (item 5) has a known bug where an
-unnecessary LOGIN is sent, which would cause `connect()` to fail on
-PREAUTH connections.  **STARTTLS happy path** (item 1) remains untestable
-without a TLS-capable mock server but is not exercised in production
+(timeouts, capability detection, STARTTLS gating, PREAUTH, BYE, and
+CONDSTORE SEARCH decoration). **STARTTLS happy path** (item 1) remains
+untestable without a TLS-capable mock server but is not exercised in production
 (KPN uses implicit TLS on port 993).

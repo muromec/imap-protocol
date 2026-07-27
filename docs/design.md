@@ -202,9 +202,9 @@ Charset detection and nested `OR` groups can be added when needed.
   dead"` rather than hanging on the 30 s timeout.  `close()` returns
   immediately on a dead connection.  Added in Batch 3a/3b (fixes
   `untested.md` #7 and `idle-races.md` #10).
-- **Untagged BYE** is not yet handled — the socket will emit `"close"` but
-  no promise is rejected.  The next command will fail.  Tracked as a
-  medium-risk concern in `docs/untested.md` (#6).
+- **Untagged BYE** marks the dispatcher dead immediately, forwards the
+  server line to the session callback, and rejects all pending commands
+  with the BYE text.
 - **`fetch()` never rejects** on protocol errors — if the server returns
   fewer results than requested, the caller gets what was returned.  This
   matches the old `node-imap` behaviour where non-existent UIDs silently
