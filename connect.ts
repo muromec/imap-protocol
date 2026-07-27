@@ -34,7 +34,9 @@ export async function connect(
   }
 
   const capabilities = new Set<string>();
-  await login(dispatcher, config);
+  if (!greeting.preauth) {
+    await login(dispatcher, config);
+  }
   await fetchCapabilities(dispatcher, capabilities);
 
   return { transport, dispatcher, capabilities };
@@ -84,7 +86,7 @@ async function createSocket(config: ImapConfig): Promise<Socket> {
 async function waitForGreeting(
   dispatcher: CommandDispatcher,
   config: ImapConfig,
-): Promise<{ starttls: boolean }> {
+): Promise<{ starttls: boolean; preauth: boolean }> {
   const tlsEnabled = config.tls !== false;
 
   return new Promise((resolve, reject) => {
@@ -109,12 +111,12 @@ async function waitForGreeting(
         // Signal that STARTTLS upgrade is needed.  The caller will
         // call starttls() with the raw socket and await its completion
         // before proceeding to login.
-        resolve({ starttls: true });
+        resolve({ starttls: true, preauth: false });
         return;
       }
 
       // No STARTTLS — proceed directly to login.
-      resolve({ starttls: false });
+      resolve({ starttls: false, preauth: line.startsWith("* PREAUTH") });
     });
   });
 }

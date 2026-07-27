@@ -31,6 +31,8 @@ export interface ScenarioStep {
 export interface ScenarioOptions {
   /** If true, unexpected commands are silently ignored instead of throwing. */
   allowExtra?: boolean;
+  /** Greeting sent when a client connects. */
+  greeting?: string;
 }
 
 // ── server ─────────────────────────────────────────────────────────────────
@@ -131,8 +133,10 @@ export class MockImapServer {
       }
     });
 
-    // send greeting
-    this.#sendRaw("* OK mock IMAP server ready" + CRLF);
+    // Defer the greeting until scenario() has configured this connection.
+    setImmediate(() => {
+      this.#sendRaw((this.#options.greeting ?? "* OK mock IMAP server ready") + CRLF);
+    });
   }
 
   // ── I/O ────────────────────────────────────────────────────────────────

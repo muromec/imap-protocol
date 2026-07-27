@@ -87,6 +87,31 @@ describe("connect", () => {
     await conn.connect();
   });
 
+  it("skips LOGIN after a PREAUTH greeting", async () => {
+    const server = await newServer();
+    server.scenario(
+      [
+        {
+          expect: /^A\d+ CAPABILITY$/,
+          respond: "* CAPABILITY IMAP4rev1 UIDPLUS",
+        },
+      ],
+      {
+        greeting: "* PREAUTH [CAPABILITY IMAP4rev1] already authenticated",
+      },
+    );
+    const conn = new Connection({
+      user: "test",
+      password: "secret",
+      host: "127.0.0.1",
+      port: server.port,
+      tls: false,
+    });
+
+    await conn.connect();
+    await server.wait();
+  });
+
   it("rejects on tagged NO to LOGIN", async () => {
     const server = await newServer();
     const conn = rawConnect(server, [
