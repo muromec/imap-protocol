@@ -257,6 +257,21 @@ describe("search", () => {
     expect(uids).toEqual([1, 2, 3]);
   });
 
+  it("rejects a pending command immediately on untagged BYE", async () => {
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [
+      {
+        expect: /^A\d+ UID SEARCH UNSEEN$/,
+        respond: "* BYE server shutting down",
+      },
+    ]);
+
+    await expect(conn.search(["UNSEEN"])).rejects.toThrow(
+      /\* BYE server shutting down/,
+    );
+    expect(conn.dead).toBe(true);
+  });
+
   it("builds criteria with nested arrays", async () => {
     const server = await newServer();
     const conn = await connectAndLogin(server, [

@@ -11,6 +11,7 @@ interface PendingEntry {
 // ── constants ──────────────────────────────────────────────────────────────
 
 const RE_TAGGED = /^(A\d+) (OK|NO|BAD) /;
+const RE_BYE = /^\* BYE\b/i;
 
 // ── CommandDispatcher ──────────────────────────────────────────────────────
 
@@ -110,6 +111,12 @@ export class CommandDispatcher {
   }
 
   #onLine(line: string): void {
+    if (RE_BYE.test(line)) {
+      this.#untaggedCallback?.(line);
+      this.#onTransportDead(new Error(line));
+      return;
+    }
+
     const tagged = line.match(RE_TAGGED);
     if (tagged) {
       const [, tag, status] = tagged;
