@@ -7,9 +7,9 @@
 // Designed to catch regressions in the Connection class without touching
 // a real mailbox.
 
-import { createServer, type Server, type Socket } from "node:net";
+import { createServer, type Server, type Socket } from 'node:net';
 
-const CRLF = "\r\n";
+const CRLF = '\r\n';
 
 // ── types ──────────────────────────────────────────────────────────────────
 
@@ -22,10 +22,7 @@ export interface ScenarioStep {
    * - string[]        → each element is one line (CRLF appended automatically).
    * - ((cmd: string) => string | string[]) → dynamic response.
    */
-  respond:
-    | string
-    | string[]
-    | ((cmd: string) => string | string[]);
+  respond: string | string[] | ((cmd: string) => string | string[]);
 }
 
 export interface ScenarioOptions {
@@ -40,7 +37,7 @@ export interface ScenarioOptions {
 export class MockImapServer {
   #server: Server;
   #socket: Socket | null = null;
-  #buf = "";
+  #buf = '';
   #step = 0;
   #scenario: ScenarioStep[] = [];
   #options: ScenarioOptions = {};
@@ -59,10 +56,10 @@ export class MockImapServer {
     this.#server = createServer((socket) => this.#onConnection(socket));
 
     // don't crash the process on socket errors in tests
-    this.#server.on("error", () => {});
+    this.#server.on('error', () => {});
 
     this.listening = new Promise((resolve) => {
-      this.#server.listen(0, "127.0.0.1", () => {
+      this.#server.listen(0, '127.0.0.1', () => {
         this.port = (this.#server.address() as { port: number }).port;
         resolve(this.port);
       });
@@ -80,7 +77,7 @@ export class MockImapServer {
     this.#scenario = steps;
     this.#options = options;
     this.#step = 0;
-    this.#buf = "";
+    this.#buf = '';
     this.#socket = null;
 
     this.#scenarioPromise = new Promise((resolve, reject) => {
@@ -105,16 +102,12 @@ export class MockImapServer {
 
   #onConnection(socket: Socket): void {
     this.#socket = socket;
-    socket.on("data", (chunk: Buffer) => this.#onData(chunk.toString("utf8")));
-    socket.on("error", () => {});
-    socket.on("close", () => {
+    socket.on('data', (chunk: Buffer) => this.#onData(chunk.toString('utf8')));
+    socket.on('error', () => {});
+    socket.on('close', () => {
       // Only reject if the scenario hasn't already resolved,
       // and only if the server isn't in allowExtra mode (cleanup race).
-      if (
-        this.#step < this.#scenario.length &&
-        this.#rejectScenario &&
-        !this.#options.allowExtra
-      ) {
+      if (this.#step < this.#scenario.length && this.#rejectScenario && !this.#options.allowExtra) {
         // Delay: let the scenario promise settle naturally if commands are
         // still being processed before the socket fully closes.
         setImmediate(() => {
@@ -135,14 +128,14 @@ export class MockImapServer {
 
     // Defer the greeting until scenario() has configured this connection.
     setImmediate(() => {
-      this.#sendRaw((this.#options.greeting ?? "* OK mock IMAP server ready") + CRLF);
+      this.#sendRaw((this.#options.greeting ?? '* OK mock IMAP server ready') + CRLF);
     });
   }
 
   // ── I/O ────────────────────────────────────────────────────────────────
 
   #sendRaw(data: string): void {
-    this.#socket?.write(data, "utf8");
+    this.#socket?.write(data, 'utf8');
   }
 
   /**
@@ -160,10 +153,10 @@ export class MockImapServer {
       const isLiteral =
         prev !== null &&
         /\{\d+\}$/.test(prev) &&
-        !prev.includes("OK") &&
-        !prev.includes("NO") &&
-        !prev.includes("BAD") &&
-        !prev.includes("SEARCH");
+        !prev.includes('OK') &&
+        !prev.includes('NO') &&
+        !prev.includes('BAD') &&
+        !prev.includes('SEARCH');
 
       if (isLiteral) {
         // Raw literal data — the reader consumes exactly {size} bytes,
@@ -195,7 +188,7 @@ export class MockImapServer {
     // DONE is sent without a tag to exit IDLE.  Handle it before the
     // normal scenario-matching logic, since it has no tag and isn't
     // part of the expected step list.
-    if (cmd.trim() === "DONE" && this.#idleTag !== null) {
+    if (cmd.trim() === 'DONE' && this.#idleTag !== null) {
       this.#sendRaw(`${this.#idleTag} OK IDLE completed` + CRLF);
       this.#idleTag = null;
       if (this.#step >= this.#scenario.length) {
@@ -207,9 +200,7 @@ export class MockImapServer {
     if (this.#step >= this.#scenario.length) {
       if (!this.#options.allowExtra) {
         this.#rejectScenario = null;
-        this.#socket?.destroy(
-          new Error(`Unexpected command after scenario finished: ${cmd}`),
-        );
+        this.#socket?.destroy(new Error(`Unexpected command after scenario finished: ${cmd}`));
         return;
       }
       // auto-respond with a tagged OK so the client's sendCommand resolves
@@ -244,18 +235,17 @@ export class MockImapServer {
     this.#step++;
 
     const tagMatch = cmd.match(/^(A\d+) /);
-    const tag = tagMatch ? tagMatch[1] : "A0000";
+    const tag = tagMatch ? tagMatch[1] : 'A0000';
 
-    const response =
-      typeof step.respond === "function" ? step.respond(cmd) : step.respond;
+    const response = typeof step.respond === 'function' ? step.respond(cmd) : step.respond;
 
     // Check if the response starts with a continuation marker (+).
     // If so, send it as a continuation (no auto-tagged OK) and enter
     // a special mode where subsequent untagged lines are served from
     // a queue until the client sends DONE.
     const lines = Array.isArray(response) ? response : [response];
-    const firstLine = lines[0] ?? "";
-    if (firstLine.startsWith("+")) {
+    const firstLine = lines[0] ?? '';
+    if (firstLine.startsWith('+')) {
       // Send the continuation line.
       this.#sendRaw(firstLine + CRLF);
 
@@ -276,7 +266,7 @@ export class MockImapServer {
 
     // Append tagged OK completion if the response doesn't already include one.
     // Each command (except IDLE) must be terminated by a tagged OK/NO/BAD.
-    const lastLine = lines[lines.length - 1] ?? "";
+    const lastLine = lines[lines.length - 1] ?? '';
     if (!/^A\d+ (OK|NO|BAD) /.test(lastLine)) {
       this.#sendRaw(`${tag} OK done` + CRLF);
     }

@@ -1,4 +1,4 @@
-import { Transport } from "./transport.ts";
+import { Transport } from './transport.ts';
 
 // ── types ──────────────────────────────────────────────────────────────────
 
@@ -51,7 +51,9 @@ export class CommandDispatcher {
     this.#defaultTimeout = defaultTimeout;
 
     transport.onLine((line) => this.#onLine(line));
-    transport.onClose(() => { this.#onTransportDead(new Error("Socket closed")) });
+    transport.onClose(() => {
+      this.#onTransportDead(new Error('Socket closed'));
+    });
     transport.onError((e) => this.#onTransportDead(e));
   }
 
@@ -68,7 +70,7 @@ export class CommandDispatcher {
    * timeout.
    */
   sendCommand(cmd: string): Promise<string[]> {
-    if (this.#dead) return Promise.reject(new Error("Connection is dead"));
+    if (this.#dead) return Promise.reject(new Error('Connection is dead'));
     const tag = this.#nextTag();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -78,7 +80,7 @@ export class CommandDispatcher {
       }, this.#defaultTimeout);
       this.#pending.set(tag, { resolve, reject, timer });
       this.#untagged = [];
-      this.#transport.send(tag + " " + cmd);
+      this.#transport.send(tag + ' ' + cmd);
     });
   }
 
@@ -107,7 +109,7 @@ export class CommandDispatcher {
   // ── internals ─────────────────────────────────────────────────────────
 
   #nextTag(): string {
-    return "A" + String(++this.#tag).padStart(4, "0");
+    return 'A' + String(++this.#tag).padStart(4, '0');
   }
 
   #onLine(line: string): void {
@@ -131,10 +133,10 @@ export class CommandDispatcher {
       this.#pending.delete(tag);
       clearTimeout(p.timer);
 
-      if (status === "OK") {
+      if (status === 'OK') {
         p.resolve([...this.#untagged]);
       } else {
-        p.reject(new Error(status + ": " + line));
+        p.reject(new Error(status + ': ' + line));
       }
       return;
     }

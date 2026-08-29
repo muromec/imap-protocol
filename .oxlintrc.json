@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "overrides": [
+    {
+      "files": ["**/*.test.ts"],
+      "rules": {
+        "unicorn/no-array-sort": "off",
+        "unicorn/no-new-array": "off",
+        "unicorn/consistent-function-scoping": "off",
+        "unicorn/no-array-reverse": "off"
+      }
+    }
+  ]
+}

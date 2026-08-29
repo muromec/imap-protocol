@@ -1,0 +1,7 @@
+node_modules
+dist
+coverage
+.vitest
+.nyc_output
+*.log
+.DS_Store

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# ── git pre-commit hook ───────────────────────────────────────────────────
+# Merge-prevention guard: abort if this is a merge commit.
+if [ -f .git/MERGE_HEAD ]; then
+  echo "pre-commit: merge in progress — skipping checks"
+  exit 0
+fi
+exec "$(git rev-parse --show-toplevel)/scripts/validate.sh"

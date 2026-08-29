@@ -1,10 +1,8 @@
-import tls from "node:tls";
-import { Socket } from "node:net";
-import type { ImapConfig } from "./interface.ts";
-import { Transport } from "./transport.ts";
-import { CommandDispatcher } from "./dispatch.ts";
-
-const CRLF = "\r\n";
+import tls from 'node:tls';
+import { Socket } from 'node:net';
+import type { ImapConfig } from './interface.ts';
+import { Transport } from './transport.ts';
+import { CommandDispatcher } from './dispatch.ts';
 
 // ── public API ─────────────────────────────────────────────────────────────
 
@@ -50,7 +48,7 @@ async function createSocket(config: ImapConfig): Promise<Socket> {
 
   return new Promise<Socket>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error("Connection timed out"));
+      reject(new Error('Connection timed out'));
     }, timeout);
 
     const onConnect = (socket: Socket) => {
@@ -64,16 +62,16 @@ async function createSocket(config: ImapConfig): Promise<Socket> {
         port: config.port,
         ...config.tlsOptions,
       });
-      socket.once("connect", () => onConnect(socket));
-      socket.once("error", (e: Error) => {
+      socket.once('connect', () => onConnect(socket));
+      socket.once('error', (e: Error) => {
         clearTimeout(timer);
         reject(e);
       });
     } else {
       const socket = new Socket();
       socket.connect(config.port, config.host);
-      socket.once("connect", () => onConnect(socket));
-      socket.once("error", (e: Error) => {
+      socket.once('connect', () => onConnect(socket));
+      socket.once('error', (e: Error) => {
         clearTimeout(timer);
         reject(e);
       });
@@ -91,19 +89,19 @@ async function waitForGreeting(
 
   return new Promise((resolve, reject) => {
     dispatcher.onUntagged((line) => {
-      if (!line.startsWith("* OK") && !line.startsWith("* PREAUTH")) return;
+      if (!line.startsWith('* OK') && !line.startsWith('* PREAUTH')) return;
 
       // Check for STARTTLS in greeting capabilities.
       const greetCaps = line.match(/CAPABILITY (.*)/i);
       const hasStarttls = greetCaps
-        ? greetCaps[1].split(/\s+/).some((c) => c.toUpperCase() === "STARTTLS")
+        ? greetCaps[1].split(/\s+/).some((c) => c.toUpperCase() === 'STARTTLS')
         : false;
 
-      const wantStarttls = config.autotls === "always" || config.autotls === "required";
+      const wantStarttls = config.autotls === 'always' || config.autotls === 'required';
       const canStarttls = !tlsEnabled && hasStarttls;
 
-      if (wantStarttls && !canStarttls && config.autotls === "required") {
-        reject(new Error("STARTTLS required but not available"));
+      if (wantStarttls && !canStarttls && config.autotls === 'required') {
+        reject(new Error('STARTTLS required but not available'));
         return;
       }
 
@@ -116,7 +114,7 @@ async function waitForGreeting(
       }
 
       // No STARTTLS — proceed directly to login.
-      resolve({ starttls: false, preauth: line.startsWith("* PREAUTH") });
+      resolve({ starttls: false, preauth: line.startsWith('* PREAUTH') });
     });
   });
 }
@@ -130,7 +128,7 @@ async function starttls(
   debugEnabled: boolean,
   config: ImapConfig,
 ): Promise<{ transport: Transport; dispatcher: CommandDispatcher }> {
-  await dispatcher.sendCommand("STARTTLS");
+  await dispatcher.sendCommand('STARTTLS');
 
   const tlsSocket = tls.connect({
     socket: rawSocket,
@@ -146,15 +144,12 @@ async function starttls(
 
 // ── authentication ─────────────────────────────────────────────────────────
 
-async function login(
-  dispatcher: CommandDispatcher,
-  config: ImapConfig,
-): Promise<void> {
+async function login(dispatcher: CommandDispatcher, config: ImapConfig): Promise<void> {
   const authTimeout = config.authTimeout ?? 10_000;
 
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error("Authentication timed out"));
+      reject(new Error('Authentication timed out'));
     }, authTimeout);
 
     dispatcher
@@ -177,7 +172,7 @@ async function fetchCapabilities(
   capabilities: Set<string>,
 ): Promise<void> {
   try {
-    const lines = await dispatcher.sendCommand("CAPABILITY");
+    const lines = await dispatcher.sendCommand('CAPABILITY');
     for (const line of lines) {
       const m = line.match(/^\* CAPABILITY (.*)/i);
       if (m) {

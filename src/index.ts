@@ -1,6 +1,4 @@
-export {
-  Connection,
-} from './connection.ts';
+export { Connection } from './connection.ts';
 export {
   type ImapConfig,
   type MailboxInfo,

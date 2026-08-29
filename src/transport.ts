@@ -1,17 +1,14 @@
-import { Socket } from "node:net";
+import { Socket } from 'node:net';
 
-const CRLF = "\r\n";
+const CRLF = '\r\n';
 
 /**
  * Thin wrapper that intercepts outgoing writes for debug logging.
  */
-function debugSocket(
-  socket: Socket,
-  onWrite: (raw: string) => void,
-): Socket {
+function debugSocket(socket: Socket, onWrite: (raw: string) => void): Socket {
   const origWrite = socket.write.bind(socket);
   socket.write = function (data: string | Buffer, ...rest: any[]) {
-    onWrite(typeof data === "string" ? data : data.toString("utf8"));
+    onWrite(typeof data === 'string' ? data : data.toString('utf8'));
     return origWrite(data, ...rest);
   } as typeof socket.write;
   return socket;
@@ -29,7 +26,7 @@ function debugSocket(
  */
 export class Transport {
   readonly #socket: Socket;
-  #buf = "";
+  #buf = '';
   #literalRemaining = 0;
   #literalChunks: string[] = [];
 
@@ -55,20 +52,20 @@ export class Transport {
   constructor(socket: Socket, debugEnabled = false) {
     this.#debugEnabled = debugEnabled;
     if (debugEnabled) {
-      debugSocket(socket, (raw) => this.#debugLog("→", raw));
+      debugSocket(socket, (raw) => this.#debugLog('→', raw));
     }
     this.#socket = socket;
 
-    socket.on("data", (chunk: Buffer) => {
-      const raw = chunk.toString("utf8");
+    socket.on('data', (chunk: Buffer) => {
+      const raw = chunk.toString('utf8');
       this.#onRawRead?.(raw);
       this.#onData(raw);
     });
 
-    socket.on("close", () => this.#onSocketClose());
-    socket.on("error", (e: Error) => {
+    socket.on('close', () => this.#onSocketClose());
+    socket.on('error', (e: Error) => {
       // ECONNRESET is a normal TCP teardown artifact — ignore it.
-      if ((e as NodeJS.ErrnoException).code === "ECONNRESET") return;
+      if ((e as NodeJS.ErrnoException).code === 'ECONNRESET') return;
       this.#onSocketError(e);
     });
   }
@@ -108,7 +105,7 @@ export class Transport {
    * NOT include it.
    */
   send(raw: string): void {
-    this.#socket.write(raw + CRLF, "utf8");
+    this.#socket.write(raw + CRLF, 'utf8');
   }
 
   /** Gracefully close the underlying socket. */
@@ -125,7 +122,7 @@ export class Transport {
 
   #debugLog(kind: string, raw: string): void {
     if (this.#debugEnabled) {
-      const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+      const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
       console.error(`[${ts}] [imap] ${kind} ${JSON.stringify(raw)}`);
     }
   }
@@ -153,7 +150,7 @@ export class Transport {
         this.#buf = this.#buf.slice(take);
 
         if (this.#literalRemaining === 0) {
-          const data = this.#literalChunks.join("");
+          const data = this.#literalChunks.join('');
           this.#literalChunks = [];
           this.#literalCallback?.(data);
           if (this.#buf.startsWith(CRLF)) {
@@ -172,7 +169,7 @@ export class Transport {
 
       if (!line) continue;
 
-      if (line.startsWith("+")) {
+      if (line.startsWith('+')) {
         this.#continueCallback?.(line);
         continue;
       }
@@ -197,14 +194,14 @@ export class Transport {
 
   #onSocketClose(): void {
     this.#dead = true;
-    this.#debugLog("socket", "closed");
+    this.#debugLog('socket', 'closed');
     this.#closeCallback?.();
   }
 
   #onSocketError(e: Error): void {
     if (this.#dead) return;
     this.#dead = true;
-    this.#debugLog("socket", `error: ${e.message}`);
+    this.#debugLog('socket', `error: ${e.message}`);
     this.#errorCallback?.(e);
   }
 }

@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "lib": ["ES2023"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

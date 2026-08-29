@@ -1,6 +1,6 @@
-import { Transport } from "./transport.ts";
-import { CommandDispatcher } from "./dispatch.ts";
-import { connect } from "./connect.ts";
+import { Transport } from './transport.ts';
+import { CommandDispatcher } from './dispatch.ts';
+import { connect } from './connect.ts';
 import {
   type ImapConfig,
   type MailboxInfo,
@@ -8,17 +8,14 @@ import {
   type IdleEvent,
 } from './interface.ts';
 
-
 // ── IMAP protocol constants ────────────────────────────────────────────────
 
-const CRLF = "\r\n";
 const RE_TAGGED = /^(A\d+) (OK|NO|BAD) /;
 const RE_EXISTS = /^\* (\d+) EXISTS/;
 const RE_RECENT = /^\* (\d+) RECENT/;
 const RE_FLAGS = /^\* FLAGS \((.*)\)/;
 const RE_SEARCH = /^\* SEARCH (.*)/;
 const RE_FETCH_START = /^\* (\d+) FETCH \((.*)/;
-const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
 
 // ── line-oriented buffered reader ──────────────────────────────────────────
 
@@ -32,22 +29,22 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
  * Lines starting with `+` are IMAP continuations and are routed to
  * `onContinue` rather than `onLine`.
  */
- // ── connection ──────────────────────────────────────────────────────────────
+// ── connection ──────────────────────────────────────────────────────────────
 
- export class Connection {
-   #config: ImapConfig;
-   #transport: Transport | null = null;
-   #dispatcher: CommandDispatcher | null = null;
-   #debugEnabled: boolean;
+export class Connection {
+  #config: ImapConfig;
+  #transport: Transport | null = null;
+  #dispatcher: CommandDispatcher | null = null;
+  #debugEnabled: boolean;
 
-   constructor(config: ImapConfig) {
-     this.#config = config;
-     this.#debugEnabled = config.debug ?? false;
-   }
-   #mailboxInfo: MailboxInfo | null = null;
+  constructor(config: ImapConfig) {
+    this.#config = config;
+    this.#debugEnabled = config.debug ?? false;
+  }
+  #mailboxInfo: MailboxInfo | null = null;
 
-   /** Server capabilities discovered after LOGIN. */
-   capabilities = new Set<string>();
+  /** Server capabilities discovered after LOGIN. */
+  capabilities = new Set<string>();
 
   // fetch state
   #fetchResolve: ((msgs: FetchedMessage[]) => void) | null = null;
@@ -85,7 +82,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
 
   #debug(kind: string, ...args: unknown[]): void {
     if (this.#debugEnabled) {
-      const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+      const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
       console.error(`[${ts}] [imap] ${kind}`, ...args);
     }
   }
@@ -94,7 +91,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     this.#transport!.onLiteral((data) => this.#onLiteral(data));
     this.#transport!.onContinue((line) => this.#onContinue(line));
     this.#transport!.onRawRead((raw) => {
-      if (this.#debugEnabled) this.#debug("←", JSON.stringify(raw));
+      if (this.#debugEnabled) this.#debug('←', JSON.stringify(raw));
     });
     this.#dispatcher!.onUntagged((line) => this.#sessionUntagged(line));
     this.#dispatcher!.onDead(() => {
@@ -140,7 +137,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
   // ── session-level untagged handler ────────────────────────────────────
 
   #sessionUntagged(line: string): void {
-    this.#debug("line", line);
+    this.#debug('line', line);
 
     // Idle hook consumes all lines (tagged and untagged) when active.
     if (this.#idleHook) this.#idleHook(line);
@@ -149,15 +146,10 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     this.#handleFetchLine(line);
   }
 
-
-
   // ── connect / close ────────────────────────────────────────────────────
 
   async connect(): Promise<void> {
-    const { transport, dispatcher, capabilities } = await connect(
-      this.#config,
-      this.#debugEnabled,
-    );
+    const { transport, dispatcher, capabilities } = await connect(this.#config, this.#debugEnabled);
     this.#transport = transport;
     this.#dispatcher = dispatcher;
     this.capabilities = capabilities;
@@ -167,7 +159,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
   async close(): Promise<void> {
     if (this.dead) return;
     try {
-      await this.sendCommand("LOGOUT");
+      await this.sendCommand('LOGOUT');
     } catch {
       // LOGOUT may fail; close the socket regardless.
     } finally {
@@ -180,7 +172,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
   // ── continuation dispatch ──────────────────────────────────────────────
 
   #onContinue(line: string): void {
-    this.#debug("cont", line);
+    this.#debug('cont', line);
     if (this.#continuationResolve) {
       const r = this.#continuationResolve;
       this.#continuationResolve = null;
@@ -201,7 +193,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     if (recent) info.unseen = Number(recent[1]);
 
     const flags = line.match(RE_FLAGS);
-    if (flags) info.flags = flags[1].split(" ").filter(Boolean);
+    if (flags) info.flags = flags[1].split(' ').filter(Boolean);
   }
 
   // ── fetch response parsing ─────────────────────────────────────────────
@@ -221,7 +213,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     const uidMatch = rest.match(/UID (\d+)/);
     const flagsMatch = rest.match(/FLAGS \(([^)]*)\)/);
     const uid = uidMatch ? Number(uidMatch[1]) : 0;
-    const flags = flagsMatch ? flagsMatch[1].split(" ").filter(Boolean) : [];
+    const flags = flagsMatch ? flagsMatch[1].split(' ').filter(Boolean) : [];
 
     // body literal: BODY[...] {size}
     const litMatch = rest.match(/BODY\[[^\]]*\] \{(\d+)\}/);
@@ -237,7 +229,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     } else {
       // inline body
       const bodyMatch = rest.match(/BODY\[[^\]]*\] (.+)/);
-      const body = bodyMatch ? bodyMatch[1] : "";
+      const body = bodyMatch ? bodyMatch[1] : '';
       this.#fetchResults.push({ uid, seqno, body, flags });
     }
 
@@ -245,8 +237,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     this.#maybeFinishFetch();
   }
 
-  #fetchQueue: Array<{ seqno: number; uid: number; flags: string[] }> | null =
-    null;
+  #fetchQueue: Array<{ seqno: number; uid: number; flags: string[] }> | null = null;
 
   #onLiteral(data: string): void {
     const ctx = this.#fetchQueue?.shift();
@@ -291,10 +282,10 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     // Only gate if we actually fetched capabilities (non-empty set).
     // Servers that don't respond to CAPABILITY are assumed to be
     // IMAP4rev1-compliant.
-    if (this.capabilities.size > 0 && !this.serverSupports("IMAP4REV1")) {
-      throw new Error("Server does not support IMAP4rev1");
+    if (this.capabilities.size > 0 && !this.serverSupports('IMAP4REV1')) {
+      throw new Error('Server does not support IMAP4rev1');
     }
-    const cmd = readOnly ? "EXAMINE" : "SELECT";
+    const cmd = readOnly ? 'EXAMINE' : 'SELECT';
     const lines = await this.sendCommand(`${cmd} "${name}"`);
 
     const info: MailboxInfo = {
@@ -314,7 +305,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
       if (recent) info.unseen = Number(recent[1]);
 
       const flags = line.match(RE_FLAGS);
-      if (flags) info.flags = flags[1].split(" ").filter(Boolean);
+      if (flags) info.flags = flags[1].split(' ').filter(Boolean);
 
       const uv = line.match(/UIDVALIDITY (\d+)/);
       if (uv) info.uidvalidity = Number(uv[1]);
@@ -340,7 +331,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
       const m = line.match(RE_SEARCH);
       if (m) {
         return m[1]
-          .replace(/\s*\(MODSEQ \d+\)\s*$/i, "")
+          .replace(/\s*\(MODSEQ \d+\)\s*$/i, '')
           .trim()
           .split(/\s+/)
           .filter(Boolean)
@@ -352,18 +343,15 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
 
   // ── fetch ───────────────────────────────────────────────────────────────
 
-  fetch(
-    uids: number[],
-    options?: { bodies?: string | string[] },
-  ): Promise<FetchedMessage[]> {
+  fetch(uids: number[], options?: { bodies?: string | string[] }): Promise<FetchedMessage[]> {
     if (uids.length === 0) return Promise.resolve([]);
     if (this.#fetchResolve) {
-      throw new Error("A fetch is already in progress; await it before starting another.");
+      throw new Error('A fetch is already in progress; await it before starting another.');
     }
 
-    const bodies = options?.bodies ?? "";
+    const bodies = options?.bodies ?? '';
     const bodyParts = Array.isArray(bodies) ? bodies : [bodies];
-    const bodySpec = bodyParts.map((b) => `BODY.PEEK[${b}]`).join(" ");
+    const bodySpec = bodyParts.map((b) => `BODY.PEEK[${b}]`).join(' ');
 
     this.#fetchResults = [];
     this.#fetchPending = 0;
@@ -371,7 +359,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
 
     return new Promise((resolve) => {
       this.#fetchResolve = resolve;
-      const uidStr = uids.join(",");
+      const uidStr = uids.join(',');
       this.sendCommand(`UID FETCH ${uidStr} (UID FLAGS ${bodySpec})`);
       // the tagged OK ends up resolving the pending promise too,
       // but we get our results via untagged fetch lines + literals.
@@ -386,17 +374,15 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
 
   async addFlags(uids: number[], flags: string | string[]): Promise<void> {
     const flagList = Array.isArray(flags) ? flags : [flags];
-    const formatted = flagList
-      .map((f) => (f.startsWith("\\") ? f : "\\" + f))
-      .join(" ");
-    const uidStr = uids.join(",");
+    const formatted = flagList.map((f) => (f.startsWith('\\') ? f : '\\' + f)).join(' ');
+    const uidStr = uids.join(',');
     await this.sendCommand(`UID STORE ${uidStr} +FLAGS.SILENT (${formatted})`);
   }
 
   // ── combined helpers ────────────────────────────────────────────────────
 
   async fetchUnseen(): Promise<FetchedMessage[]> {
-    const uids = await this.search(["UNSEEN"]);
+    const uids = await this.search(['UNSEEN']);
     if (uids.length === 0) return [];
     return this.fetch(uids);
   }
@@ -413,8 +399,8 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
    * Throws if the server does not advertise the IDLE capability.
    */
   async *idle(): AsyncIterable<IdleEvent> {
-    if (!this.serverSupports("IDLE")) {
-      throw new Error("Server does not support IDLE");
+    if (!this.serverSupports('IDLE')) {
+      throw new Error('Server does not support IDLE');
     }
 
     // Tag for this IDLE session.  We do NOT register it in the
@@ -444,7 +430,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     const idleTag = this.#idleTag;
 
     this.#idleHook = (line: string) => {
-      this.#debug("idle", line);
+      this.#debug('idle', line);
       const tagged = line.match(RE_TAGGED);
       if (tagged) {
         if (tagged[1] === idleTag) {
@@ -469,10 +455,10 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     const continuationPromise: Promise<string> = new Promise((resolve) => {
       this.#continuationResolve = resolve;
     });
-    this.#transport!.send(this.#idleTag + " IDLE");
+    this.#transport!.send(this.#idleTag + ' IDLE');
 
     const contLine = await continuationPromise;
-    if (!contLine.startsWith("+")) {
+    if (!contLine.startsWith('+')) {
       this.#idleHook = null;
       this.#idleEventResolve = null;
       throw new Error(`Expected continuation, got: ${contLine}`);
@@ -481,11 +467,13 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
     // Yield events as they arrive.
     try {
       let first = true;
-      while (!done) {
-        const event = await (first ? firstEventPromise : new Promise<IdleEvent | null>((resolve) => {
-          eventResolve = resolve;
-          this.#idleEventResolve = resolve;
-        }));
+      while (true) {
+        const event = await (first
+          ? firstEventPromise
+          : new Promise<IdleEvent | null>((resolve) => {
+              eventResolve = resolve;
+              this.#idleEventResolve = resolve;
+            }));
         first = false;
         if (event === null) break;
         yield event;
@@ -498,7 +486,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
       if (this.#idleHook != null && this.#transport != null) {
         // Send DONE
         try {
-          this.#transport.send("DONE");
+          this.#transport.send('DONE');
 
           // Drain: wait for tagged OK for IDLE
           await new Promise<void>((resolve) => {
@@ -511,7 +499,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
             yield ev;
           }
         } catch (err) {
-          console.error(new Error("Unhandled error in idle finally", { cause: err }));
+          console.error(new Error('Unhandled error in idle finally', { cause: err }));
         }
       }
 
@@ -523,7 +511,7 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
   }
 
   // Tag of the current IDLE command, set when idle() is called.
-  #idleTag: string = "";
+  #idleTag: string = '';
 
   /**
    * Parse an untagged IMAP line into an IdleEvent, or null if the line
@@ -532,17 +520,17 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
   #parseIdleEvent(line: string): IdleEvent | null {
     const exists = line.match(RE_EXISTS);
     if (exists) {
-      return { type: "exists", count: Number(exists[1]) };
+      return { type: 'exists', count: Number(exists[1]) };
     }
 
     const recent = line.match(RE_RECENT);
     if (recent) {
-      return { type: "recent", count: Number(recent[1]) };
+      return { type: 'recent', count: Number(recent[1]) };
     }
 
     const expunge = line.match(/^\* (\d+) EXPUNGE/);
     if (expunge) {
-      return { type: "expunge", seqno: Number(expunge[1]) };
+      return { type: 'expunge', seqno: Number(expunge[1]) };
     }
 
     const fetchStart = line.match(RE_FETCH_START);
@@ -551,19 +539,19 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
       const uidMatch = rest.match(/UID (\d+)/);
       const flagsMatch = rest.match(/FLAGS \(([^)]*)\)/);
       return {
-        type: "fetch",
+        type: 'fetch',
         seqno: Number(fetchStart[1]),
         uid: uidMatch ? Number(uidMatch[1]) : undefined,
-        flags: flagsMatch ? flagsMatch[1].split(" ").filter(Boolean) : [],
+        flags: flagsMatch ? flagsMatch[1].split(' ').filter(Boolean) : [],
       };
     }
 
     const flags = line.match(/^\* (\d+) FETCH \(FLAGS \(([^)]*)\)\)/);
     if (flags) {
       return {
-        type: "flags",
+        type: 'flags',
         seqno: Number(flags[1]),
-        flags: flags[2].split(" ").filter(Boolean),
+        flags: flags[2].split(' ').filter(Boolean),
       };
     }
 
@@ -574,56 +562,54 @@ const RE_CAPABILITY = /^\* CAPABILITY (.*)/i;
 // ── search query builder ────────────────────────────────────────────────────
 
 function escapeString(str: string): string {
-  return `"${str.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  return `"${str.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 function buildSearchQuery(criteria: any[]): string {
   const parts: string[] = [];
   for (const item of criteria) {
-    if (typeof item === "string") {
+    if (typeof item === 'string') {
       parts.push(item);
     } else if (Array.isArray(item)) {
       const [key, ...args] = item;
       switch (key.toUpperCase()) {
-        case "BCC":
-        case "BODY":
-        case "CC":
-        case "FROM":
-        case "SUBJECT":
-        case "TEXT":
-        case "TO":
-        case "KEYWORD":
+        case 'BCC':
+        case 'BODY':
+        case 'CC':
+        case 'FROM':
+        case 'SUBJECT':
+        case 'TEXT':
+        case 'TO':
+        case 'KEYWORD':
           parts.push(`${key} ${escapeString(String(args[0]))}`);
           break;
-        case "HEADER":
+        case 'HEADER':
           parts.push(
-            `${key} ${escapeString(String(args[0]))} ${escapeString(String(args[1] ?? ""))}`,
+            `${key} ${escapeString(String(args[0]))} ${escapeString(String(args[1] ?? ''))}`,
           );
           break;
-        case "BEFORE":
-        case "ON":
-        case "SINCE":
-        case "SENTBEFORE":
-        case "SENTON":
-        case "SENTSINCE":
+        case 'BEFORE':
+        case 'ON':
+        case 'SINCE':
+        case 'SENTBEFORE':
+        case 'SENTON':
+        case 'SENTSINCE':
           parts.push(`${key} ${escapeString(String(args[0]))}`);
           break;
-        case "LARGER":
-        case "SMALLER":
+        case 'LARGER':
+        case 'SMALLER':
           parts.push(`${key} ${args[0]}`);
           break;
-        case "UID":
-          parts.push(`${key} ${args.join(",")}`);
+        case 'UID':
+          parts.push(`${key} ${args.join(',')}`);
           break;
-        case "OR":
-          parts.push(
-            `OR (${buildSearchQuery(args[0])}) (${buildSearchQuery(args[1])})`,
-          );
+        case 'OR':
+          parts.push(`OR (${buildSearchQuery(args[0])}) (${buildSearchQuery(args[1])})`);
           break;
         default:
           parts.push(key);
       }
     }
   }
-  return parts.join(" ");
+  return parts.join(' ');
 }

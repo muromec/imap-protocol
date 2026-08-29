@@ -1,5 +1,5 @@
-import { Connection } from "./connection.ts";
-import { type IdleEvent, type FetchedMessage } from "./interface.ts";
+import { Connection } from './connection.ts';
+import { type FetchedMessage } from './interface.ts';
 
 // ── types ──────────────────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@ export interface WatcherConfig {
 }
 
 export interface WatcherEvent {
-  type: "connected" | "disconnected" | "mail" | "expunge" | "fetch" | "error";
+  type: 'connected' | 'disconnected' | 'mail' | 'expunge' | 'fetch' | 'error';
   messages?: FetchedMessage[];
   error?: Error;
 }
@@ -69,7 +69,7 @@ export class MailboxWatcher extends EventTarget {
     this.#abortController = new AbortController();
     const signal = this.#abortController.signal;
 
-    const mailbox = this.#config.mailbox ?? "INBOX";
+    const mailbox = this.#config.mailbox ?? 'INBOX';
     const keepalive = this.#config.keepaliveInterval ?? 25_000;
     const reconnectDelay = this.#config.reconnectDelay ?? 3_000;
 
@@ -87,8 +87,8 @@ export class MailboxWatcher extends EventTarget {
 
         await conn.connect();
 
-        if (!conn.serverSupports("IDLE")) {
-          this.#emit({ type: "error", error: new Error("Server does not support IDLE") });
+        if (!conn.serverSupports('IDLE')) {
+          this.#emit({ type: 'error', error: new Error('Server does not support IDLE') });
           await conn.close();
           return;
         }
@@ -99,10 +99,10 @@ export class MailboxWatcher extends EventTarget {
         const existing = await conn.fetchUnseen();
         if (existing.length > 0) {
           await this.#markSeen(conn, existing);
-          this.#emit({ type: "mail", messages: existing });
+          this.#emit({ type: 'mail', messages: existing });
         }
 
-        this.#emit({ type: "connected" });
+        this.#emit({ type: 'connected' });
 
         // Enter the IDLE loop for this connection.
         await this.#idleLoop(conn, box.total, keepalive, signal);
@@ -110,8 +110,10 @@ export class MailboxWatcher extends EventTarget {
         await conn.close();
       } catch (err) {
         if (signal.aborted) break;
-        this.#emit({ type: "error", error: err as Error });
-        try { await conn?.close(); } catch {}
+        this.#emit({ type: 'error', error: err as Error });
+        try {
+          await conn?.close();
+        } catch {}
       }
 
       if (signal.aborted) break;
@@ -128,12 +130,10 @@ export class MailboxWatcher extends EventTarget {
   // ── events ──────────────────────────────────────────────────────────────
 
   on(
-    type: "mail" | "connected" | "disconnected" | "error",
+    type: 'mail' | 'connected' | 'disconnected' | 'error',
     listener: (event: WatcherEvent) => void,
   ): void {
-    this.addEventListener(type, (e) =>
-      listener((e as CustomEvent<WatcherEvent>).detail),
-    );
+    this.addEventListener(type, (e) => listener((e as CustomEvent<WatcherEvent>).detail));
   }
 
   #emit(event: WatcherEvent): void {
@@ -159,18 +159,17 @@ export class MailboxWatcher extends EventTarget {
       // Race: IDLE events vs keepalive timer.
       let idleEnded = false;
       let mailArrived = false;
-      let iterator: AsyncIterator<IdleEvent> | null = null;
+      const iterator = conn.idle()[Symbol.asyncIterator]();
 
       const idlePromise = (async () => {
-        iterator = conn.idle()[Symbol.asyncIterator]();
         for (;;) {
           const { value: event, done } = await iterator.next();
           if (done) break;
           if (signal.aborted) break;
 
           switch (event.type) {
-            case "exists":
-            case "recent": {
+            case 'exists':
+            case 'recent': {
               const count = event.count ?? 0;
               const arrived = count - existingTotal;
               existingTotal = count;
@@ -181,11 +180,11 @@ export class MailboxWatcher extends EventTarget {
               }
               break;
             }
-            case "expunge":
+            case 'expunge':
               existingTotal = Math.max(0, existingTotal - 1);
               break;
-            case "fetch":
-            case "flags":
+            case 'fetch':
+            case 'flags':
               break;
           }
         }
@@ -194,7 +193,7 @@ export class MailboxWatcher extends EventTarget {
 
       const keepalivePromise = this.#sleep(keepalive, signal).then(() => {
         // Timer fired — break out of IDLE to cycle it.
-        if (!idleEnded && iterator) (iterator as any)["return"]?.();
+        if (!idleEnded) iterator.return?.();
       });
 
       await Promise.race([idlePromise, keepalivePromise]);
@@ -203,7 +202,7 @@ export class MailboxWatcher extends EventTarget {
       // If idleEnded is already true (socket closed or mail arrived),
       // the iterator is done and calling return() is unnecessary and
       // may trigger a write to a dead socket.
-      if (iterator && !idleEnded) await (iterator as any)["return"]?.();
+      if (!idleEnded) await iterator.return?.();
 
       if (signal.aborted) break;
 
@@ -217,7 +216,7 @@ export class MailboxWatcher extends EventTarget {
       if (unseen.length > 0) {
         await this.#markSeen(conn, unseen);
         existingTotal = existingTotal + unseen.length;
-        this.#emit({ type: "mail", messages: unseen });
+        this.#emit({ type: 'mail', messages: unseen });
       }
     }
   }
@@ -226,7 +225,7 @@ export class MailboxWatcher extends EventTarget {
     const uids = msgs.map((m) => m.uid);
     if (uids.length === 0) return;
     try {
-      await conn.addFlags(uids, "\\Seen");
+      await conn.addFlags(uids, '\\Seen');
     } catch {
       // best-effort
     }
@@ -236,10 +235,14 @@ export class MailboxWatcher extends EventTarget {
     return new Promise((resolve) => {
       if (signal.aborted) return resolve();
       const timer = setTimeout(resolve, ms);
-      signal.addEventListener("abort", () => {
-        clearTimeout(timer);
-        resolve();
-      }, { once: true });
+      signal.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        { once: true },
+      );
     });
   }
 }

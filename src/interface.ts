@@ -15,7 +15,7 @@ export interface ImapConfig {
    * - "required": require STARTTLS, throw if unavailable
    * - undefined: never attempt STARTTLS (only use implicit TLS or plain)
    */
-  autotls?: "always" | "required";
+  autotls?: 'always' | 'required';
   /** Timeout for TLS handshake + server greeting (ms). Default 30_000. */
   connTimeout?: number;
   /** Timeout for LOGIN response (ms). Default 10_000. */
@@ -47,7 +47,7 @@ export interface FetchedMessage {
 }
 
 export interface IdleEvent {
-  type: "exists" | "recent" | "expunge" | "fetch" | "flags";
+  type: 'exists' | 'recent' | 'expunge' | 'fetch' | 'flags';
   seqno?: number;
   count?: number;
   uid?: number;
