@@ -26,7 +26,7 @@ export interface WatcherConfig {
 }
 
 export interface WatcherEvent {
-  type: 'connected' | 'disconnected' | 'mail' | 'expunge' | 'fetch' | 'error';
+  type: 'connected' | 'disconnected' | 'mail' | 'error';
   messages?: FetchedMessage[];
   error?: Error;
 }
@@ -37,14 +37,14 @@ export interface WatcherEvent {
  * High-level mailbox watcher built on top of Connection.
  *
  * Wraps the low-level IDLE loop with automatic reconnection on disconnect,
- * keepalive IDLE cycling to prevent server timeouts, and a simple
- * event-based API.
+ * keepalive IDLE cycling to prevent server timeouts, and raw fetched
+ * messages (callers apply their own message parsing).
  *
  * Usage:
  * ```ts
  * const watcher = new MailboxWatcher(config);
- * watcher.on("mail", (event) => {
- *   for (const msg of event.messages) {
+ * watcher.on('mail', (event) => {
+ *   for (const msg of event.messages ?? []) {
  *     console.log(msg.body);
  *   }
  * });
@@ -54,6 +54,7 @@ export interface WatcherEvent {
 export class MailboxWatcher extends EventTarget {
   #config: WatcherConfig;
   #abortController: AbortController | null = null;
+  #activeConn: Connection | null = null;
 
   constructor(config: WatcherConfig) {
     super();
@@ -75,6 +76,7 @@ export class MailboxWatcher extends EventTarget {
 
     while (!signal.aborted) {
       let conn: Connection | null = null;
+      this.#activeConn = null;
       try {
         conn = new Connection({
           user: this.#config.user,
@@ -86,9 +88,13 @@ export class MailboxWatcher extends EventTarget {
         });
 
         await conn.connect();
+        this.#activeConn = conn;
 
         if (!conn.serverSupports('IDLE')) {
-          this.#emit({ type: 'error', error: new Error('Server does not support IDLE') });
+          this.#emit({
+            type: 'error',
+            error: new Error('Server does not support IDLE'),
+          });
           await conn.close();
           return;
         }
@@ -121,8 +127,10 @@ export class MailboxWatcher extends EventTarget {
     }
   }
 
-  /** Stop watching.  The running IDLE session will exit cleanly. */
+  /** Stop watching.  Closes the active connection and aborts the loop. */
   stop(): void {
+    this.#activeConn?.close().catch(() => {});
+    this.#activeConn = null;
     this.#abortController?.abort();
     this.#abortController = null;
   }
@@ -158,7 +166,6 @@ export class MailboxWatcher extends EventTarget {
     while (!signal.aborted) {
       // Race: IDLE events vs keepalive timer.
       let idleEnded = false;
-      let mailArrived = false;
       const iterator = conn.idle()[Symbol.asyncIterator]();
 
       const idlePromise = (async () => {
@@ -175,7 +182,6 @@ export class MailboxWatcher extends EventTarget {
               existingTotal = count;
               if (arrived > 0) {
                 idleEnded = true;
-                mailArrived = true;
                 return; // exit to fetch below
               }
               break;
@@ -199,19 +205,16 @@ export class MailboxWatcher extends EventTarget {
       await Promise.race([idlePromise, keepalivePromise]);
 
       // Exit IDLE cleanly if it hasn't already ended (timed out).
-      // If idleEnded is already true (socket closed or mail arrived),
-      // the iterator is done and calling return() is unnecessary and
-      // may trigger a write to a dead socket.
       if (!idleEnded) await iterator.return?.();
 
       if (signal.aborted) break;
 
-      // Only fetch if IDLE ended due to a mail event (EXISTS/RECENT
-      // with arrived > 0).  If the timer fired or the socket closed,
-      // there's nothing new — just cycle back into IDLE.
-      if (!mailArrived) continue;
+      // If the connection died during the DONE/drain phase (server
+      // closed the socket), return so the outer loop reconnects.
+      if (conn.dead) return;
 
-      // Fetch the new messages.
+      // Always fetch unseen after idle ends.  Mail may have arrived
+      // during a keepalive cycle or while we were reconnecting.
       const unseen = await conn.fetchUnseen();
       if (unseen.length > 0) {
         await this.#markSeen(conn, unseen);

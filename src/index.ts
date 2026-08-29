@@ -5,3 +5,4 @@ export {
   type FetchedMessage,
   type IdleEvent,
 } from './interface.ts';
+export { MailboxWatcher, type WatcherConfig, type WatcherEvent } from './watcher.ts';
