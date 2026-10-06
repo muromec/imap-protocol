@@ -14,6 +14,11 @@ export interface WatcherConfig {
   /** Mailbox to watch. Default "INBOX". */
   mailbox?: string;
 
+  /** Flag each message `\Seen` once it has been handed over.  Default true:
+   *  set false to leave that decision to the caller, which flags through
+   *  {@link MailboxWatcher.connection} instead. */
+  markSeen?: boolean;
+
   /** Interval (ms) between keepalive IDLE re-entries.  Must be less than
    *  the server's IDLE timeout.  Default 25_000 (25 seconds). */
   keepaliveInterval?: number;
@@ -38,9 +43,10 @@ export interface WatcherEvent {
  *
  * Wraps the low-level IDLE loop with automatic reconnection on disconnect,
  * keepalive IDLE cycling to prevent server timeouts, and raw fetched
- * messages.  It marks nothing: parsing a message and deciding what it means —
- * including whether it has been read — is the caller's business, and
- * {@link MailboxWatcher.connection} is there for the caller that wants to do it.
+ * messages.  Parsing a message is the caller's business.  By default the
+ * watcher also flags each message `\Seen`, after handing it over and never
+ * before; `markSeen: false` leaves that decision to the caller, which flags
+ * through {@link MailboxWatcher.connection}.
  *
  * Usage:
  * ```ts
@@ -107,6 +113,7 @@ export class MailboxWatcher extends EventTarget {
         const existing = await conn.fetchUnseen();
         if (existing.length > 0) {
           this.#emit({ type: 'mail', messages: existing });
+          await this.#markSeen(conn, existing);
         }
 
         this.#emit({ type: 'connected' });
@@ -230,7 +237,29 @@ export class MailboxWatcher extends EventTarget {
       if (unseen.length > 0) {
         existingTotal = existingTotal + unseen.length;
         this.#emit({ type: 'mail', messages: unseen });
+        await this.#markSeen(conn, unseen);
       }
+    }
+  }
+
+  /**
+   * Flag a delivered batch `\Seen`, after the caller has been given it, and only
+   * when `markSeen` allows.  A refused flag is reported: the message is already
+   * in the caller's hands, so a swallow here is invisible on both sides.
+   */
+  async #markSeen(conn: Connection, msgs: FetchedMessage[]): Promise<void> {
+    if (this.#config.markSeen === false) return;
+    const uids = msgs.map((m) => m.uid);
+    if (uids.length === 0) return;
+    try {
+      await conn.addFlags(uids, '\\Seen');
+    } catch (err) {
+      this.#emit({
+        type: 'error',
+        error: new Error(
+          `could not flag ${uids.length} delivered message(s) as seen: ${(err as Error).message}`,
+        ),
+      });
     }
   }
 
