@@ -38,7 +38,9 @@ export interface WatcherEvent {
  *
  * Wraps the low-level IDLE loop with automatic reconnection on disconnect,
  * keepalive IDLE cycling to prevent server timeouts, and raw fetched
- * messages (callers apply their own message parsing).
+ * messages.  It marks nothing: parsing a message and deciding what it means —
+ * including whether it has been read — is the caller's business, and
+ * {@link MailboxWatcher.connection} is there for the caller that wants to do it.
  *
  * Usage:
  * ```ts
@@ -104,7 +106,6 @@ export class MailboxWatcher extends EventTarget {
         // Fetch whatever is already unseen on first connect.
         const existing = await conn.fetchUnseen();
         if (existing.length > 0) {
-          await this.#markSeen(conn, existing);
           this.#emit({ type: 'mail', messages: existing });
         }
 
@@ -134,6 +135,16 @@ export class MailboxWatcher extends EventTarget {
     this.#abortController?.abort();
     this.#abortController = null;
   }
+  /**
+   * The connection in use, or null between attempts.
+   *
+   * Exposed so a caller can decide a message's fate — flag it read when it
+   * chooses to, which is the one thing this loop no longer decides for it.
+   */
+  get connection(): Connection | null {
+    return this.#activeConn;
+  }
+
 
   // ── events ──────────────────────────────────────────────────────────────
 
@@ -217,20 +228,9 @@ export class MailboxWatcher extends EventTarget {
       // during a keepalive cycle or while we were reconnecting.
       const unseen = await conn.fetchUnseen();
       if (unseen.length > 0) {
-        await this.#markSeen(conn, unseen);
         existingTotal = existingTotal + unseen.length;
         this.#emit({ type: 'mail', messages: unseen });
       }
-    }
-  }
-
-  async #markSeen(conn: Connection, msgs: FetchedMessage[]): Promise<void> {
-    const uids = msgs.map((m) => m.uid);
-    if (uids.length === 0) return;
-    try {
-      await conn.addFlags(uids, '\\Seen');
-    } catch {
-      // best-effort
     }
   }
 
