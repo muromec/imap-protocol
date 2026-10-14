@@ -176,4 +176,94 @@ describe('Session', () => {
     expect(ends).toEqual(['Socket closed']);
     expect(server.session.dead).toBe(true);
   });
+
+  it('opens a session on the first read, and hands its lines to the reader', async () => {
+    const server = await startSession();
+    const session = server.session.idle()[Symbol.asyncIterator]();
+
+    const reading = session.next();
+    await server.lines(1, 'the IDLE command');
+    expect(server.received).toEqual(['A0001 IDLE']);
+
+    server.answer('+ idling\r\n* 1 EXISTS\r\n');
+    expect(await reading).toEqual({ done: false, value: '* 1 EXISTS' });
+  });
+
+  it('breaks the session for a command, then opens it again', async () => {
+    const server = await startSession();
+    const session = server.session.idle()[Symbol.asyncIterator]();
+    const reading = session.next();
+    await server.lines(1, 'the IDLE command');
+    server.answer('+ idling\r\n');
+
+    const command = server.session.sendCommand('NOOP');
+    await server.lines(2, 'DONE');
+    expect(server.received[1]).toBe('DONE');
+
+    server.answer('A0001 OK IDLE completed\r\n');
+    await server.lines(3, 'the command');
+    expect(server.received[2]).toBe('A0002 NOOP');
+    server.answer('A0002 OK done\r\n');
+    expect(await command).toEqual([]);
+
+    // the reader still wants lines, so the session stands again
+    await server.lines(4, 'the session reopened');
+    expect(server.received[3]).toBe('A0003 IDLE');
+    server.answer('+ idling\r\n* 2 EXISTS\r\n');
+    expect(await reading).toEqual({ done: false, value: '* 2 EXISTS' });
+
+    const ending = session.return?.();
+    await server.lines(5, 'DONE');
+    server.answer('A0003 OK IDLE completed\r\n');
+    await ending;
+  });
+
+  it('ends a session when its reader returns, and the connection carries on', async () => {
+    const server = await startSession();
+    const session = server.session.idle()[Symbol.asyncIterator]();
+    const reading = session.next();
+    await server.lines(1, 'the IDLE command');
+    server.answer('+ idling\r\n');
+
+    const ending = session.return?.();
+    await server.lines(2, 'DONE');
+    expect(server.received[1]).toBe('DONE');
+    server.answer('A0001 OK IDLE completed\r\n');
+    await ending;
+
+    expect(await session.next()).toEqual({ done: true, value: undefined });
+
+    const command = server.session.sendCommand('NOOP');
+    await server.lines(3, 'the command');
+    server.answer('A0002 OK done\r\n');
+    expect(await command).toEqual([]);
+  });
+
+  it('stops the reader when the server ends the session', async () => {
+    const server = await startSession();
+    const session = server.session.idle()[Symbol.asyncIterator]();
+    const reading = session.next();
+    await server.lines(1, 'the IDLE command');
+    server.answer('+ idling\r\n');
+
+    server.answer('A0001 NO IDLE not here\r\n');
+    expect(await reading).toEqual({ done: true, value: undefined });
+  });
+
+  it('ends a session its reader forgot about', async () => {
+    const server = await startSession({ sessionTimeout: 60 });
+    const session = server.session.idle()[Symbol.asyncIterator]();
+    const reading = session.next();
+    await server.lines(1, 'the IDLE command');
+
+    // the guard closes the connection, and the reader hears the session end
+    expect(await reading).toEqual({ done: true, value: undefined });
+  });
+
+  it('refuses a second session rather than replacing the first', async () => {
+    const server = await startSession();
+    server.session.idle();
+
+    expect(() => server.session.idle()).toThrow(/already open/);
+  });
 });
