@@ -1,35 +1,5 @@
 import { Transport, type TransportItem } from './transport.ts';
-
-// ── reply collection ───────────────────────────────────────────────────────
-
-/**
- * How one command's reply is read.
- *
- * The loop hands a command's collector every item that arrives while that
- * command is the oldest one outstanding — the IMAP server answers in order,
- * so its untagged lines come before its tagged reply — and the collector
- * decides what belongs to it.  On the tagged OK the loop asks for the result;
- * a NO / BAD is the loop's to reject, not the collector's.
- */
-export interface Collector<T> {
-  /** One item that arrived while this command was outstanding. */
-  accept(item: TransportItem): void;
-  /** The command was answered: what came of it. */
-  finish(): T;
-}
-
-/** The reply as the lines it was — what most commands are. */
-export class LinesCollector implements Collector<string[]> {
-  readonly lines: string[] = [];
-
-  accept(item: TransportItem): void {
-    if (item.kind === 'line') this.lines.push(item.line);
-  }
-
-  finish(): string[] {
-    return this.lines;
-  }
-}
+import { LinesCollector, type Collector } from './collectors.ts';
 
 // ── session ────────────────────────────────────────────────────────────────
 
