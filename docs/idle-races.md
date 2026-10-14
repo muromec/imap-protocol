@@ -1,5 +1,18 @@
 # IDLE race conditions — imap-connector
 
+> **Historical, 2026-10-14.**  This analysis was written against the architecture
+> before the session loop: one `ImapReader` serialising everything through
+> `#dispatchLine`, a shared `#pending` map, and IDLE as a second command path.
+> `docs/architecture.md` describes what replaced it; the races below are worth
+> reading for what the loop removes by construction rather than for what the code
+> does now.  The ones the loop answers directly: the tag of an IDLE session is
+> the loop's own and is settled in the same table as every other command, so no
+> reply can be eaten by a hook that runs first; a command is never written while
+> a session is open, so nothing but DONE can be sent during one; the connection
+> ending arrives as an item, so a drain cannot hang on a promise that only a
+> server or a socket event could settle; and a command asked for during a session
+> is queued rather than refused, so a keepalive and a caller cannot collide.
+
 This document analyses every race condition that can arise when implementing
 the `idle()` and `watch()` methods described in Batch 3 of the roadmap.  The
 analysis assumes the current architecture: a single-threaded Node.js event

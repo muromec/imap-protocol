@@ -18,6 +18,13 @@ dependencies, promise-based API, no streaming parser unless necessary.
 | 7 | Advanced search and sort | Not started | — |
 | 8 | Gmail extensions | Not started | — |
 
+> **2026-10-14.**  The batches below are feature batches and their counts predate
+> 0.4.0, which was an internal rewrite rather than a batch: one loop per connection
+> owns every write, commands are queued and written as one batch, and IDLE is a
+> state of that loop instead of a second command path.  The operations and their
+> signatures are unchanged, except that `Connection.sendCommandWithContinuation`
+> is gone (its only caller was a test).  See `docs/architecture.md`.
+
 ## Guiding principles
 
 1. **Reject outdated servers.** If a required capability (e.g. `UIDPLUS`,

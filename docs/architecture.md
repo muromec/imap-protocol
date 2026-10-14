@@ -1,185 +1,165 @@
-# Architecture — imap-connector
+# Architecture — imap-protocol
 
-`imap-connector` is decomposed into four files with clear layer boundaries.
-The public API (`Connection`) is unchanged; the internals are split across
-Transport, CommandDispatcher, connection setup, and the session layer.
+One connection is one loop.  The transport frames bytes and hands them over as
+items; the session owns every write and every tag, queues commands, and holds
+IDLE as one of its states; the connection spells the IMAP operations in terms
+of the session.
 
-Tests: `connection.test.ts` — 47 passed, 2 todo (vitest, ~3s).
+Tests: 75 passed, 2 todo (five files, ~4s).  `docs/untested.md` names what they
+do not cover.
 
-> **Open proposal on the session layer** — `docs/proposals/session-layers.md`
-> (2026-10-14).  It names the five cross-layer couplings this document counts as one,
-> and the shape that removes them: IDLE as a command of the pending table, response
-> assemblers as their own objects, the rule about commands during a session in one
-> place, and the tests' double as a server model rather than a scenario.
+> As built 2026-10-14 from `docs/proposals/session-layers.md`.  The shape it
+> replaced — a `CommandDispatcher` with a single untagged accumulator, IDLE as a
+> parallel command path with its own tag and hooks, and a fetch assembler living
+> in `connection.ts` — is described in that proposal's "What is there now" and
+> in `idle-races.md`, which reasons about the races the old shape had.
 
 ---
 
-## Layer 1 — Transport (`transport.ts`, 210 lines)
+## Layer 1 — Transport (`transport.ts`, 253 lines)
 
-**Responsibility:** turn a raw TCP stream into framed IMAP lines/literals/
-continuations and back.  The only layer that knows about `\r\n`, `{size}`
-literals, `+` continuations, and raw socket reads/writes.  Has no knowledge
-of IMAP semantics — no tags, no OK/NO/BAD, no command meanings.
+**Responsibility:** turn a TCP/TLS stream into framed IMAP items.  The only
+layer that knows about `\r\n`, `{size}` literals, `+` continuations, and raw
+socket reads and writes.  No IMAP semantics — no tags, no OK/NO/BAD, no
+command meanings.
 
 ### State
 
-- `socket: Socket` — the underlying TCP or TLS socket (already connected
-  when passed to the constructor).
-- `buf`, `literalRemaining`, `literalChunks` — line/literal framing buffer.
-- `dead: boolean` — set on socket close or error.
-- Callbacks: `onLine`, `onLiteral`, `onContinue`, `onClose`, `onError`,
-  `onRawRead` — single-slot each (setting replaces previous).
+- `#socket` — the connected socket (TCP or TLS), handed in by `connect.ts`.
+- `#buf`, `#literalRemaining`, `#literalChunks` — the framing buffers.
+- `#items: TransportItems | null` — the item stream, created on first read.
+- `#dead` — set on close or error.
+- `#onRawRead` — the debug seam: every raw read, when a caller wants it.
 
-### Public interface
+### Items
+
+```ts
+type TransportItem =
+  | { kind: 'line'; line: string }
+  | { kind: 'continue'; line: string }
+  | { kind: 'literal'; data: string }
+  | { kind: 'ended'; error?: Error };
+```
+
+`items()` returns an `AsyncIterable` the session loop reads.  `ended` is
+delivered as the last item, so a `for await` reader learns why it stopped
+instead of falling out of the loop; the call after it reports the iteration
+finished.  One reader by construction.
 
 | Method | Description |
 |---|---|
-| `constructor(socket, debug?)` | Wrap a connected socket.  Registers `data`, `close`, `error` handlers.  If debug is enabled, wraps `socket.write` for logging. |
-| `send(raw)` | Write bytes to the socket.  CRLF is appended automatically. |
-| `onLine(cb)` | Callback for each complete framed line (excluding `+` lines and literal data). |
-| `onLiteral(cb)` | Callback for each literal body (after `{size}` synchronisation). |
-| `onContinue(cb)` | Callback for `+` continuation lines. |
-| `onClose(cb)` | Socket closed. |
-| `onError(cb)` | Socket error (ECONNRESET is silently ignored as normal TCP teardown). |
-| `onRawRead(cb)` | Raw-read hook for debug logging. |
-| `close()` | Gracefully close the socket. |
-| `setDebug(enabled)` | Toggle debug logging at runtime. |
+| `constructor(socket, debug?)` | Registers `data`, `close`, `error`.  With debug on, wraps `socket.write` to log writes. |
+| `send(raw)` | Write a line; CRLF is appended. |
+| `items()` | The framing as a stream, for the loop. |
+| `onRawRead(cb)` | Raw reads, for debug logging. |
+| `close()` | Close the socket. |
+| `setDebug(enabled)` | Toggle write logging at runtime. |
 | `dead` | Whether the socket has closed or errored. |
 
-### Debug logging
-
-When enabled, raw socket writes are logged with `→` and reads with `←`
-(both JSON-escaped).  Output goes to stderr with `[imap]` prefix and
-ISO timestamps.  Writes are intercepted via a `socket.write` monkey-patch;
-reads are logged from the `data` event handler.
+Debug output goes to stderr with `[imap]` and a timestamp: writes as `→`,
+reads as `←` (the read half is wired by `Connection`), both JSON-escaped.
 
 ---
 
-## Layer 2 — CommandDispatcher (`dispatch.ts`, 153 lines)
+## Layer 2 — Session (`session.ts`, 466 lines)
 
-**Responsibility:** pair tagged IMAP commands with their tagged responses.
-Sends a command with a unique `A0001`-style tag, collects untagged lines
-that arrive before the matching tagged OK/NO/BAD, and resolves or rejects
-the per-command promise.  Also handles per-command timeouts.
+**Responsibility:** the wire, one command at a time.  The session is the only
+reader of the transport's item stream and the only writer on the socket.
 
-Has no knowledge of IMAP semantics — does not know what LOGIN, SELECT,
-FETCH, or IDLE mean.
+### What it owns
 
-### State
+- The tag counter, and the two tables: `#queue` (asked for, not yet written)
+  and `#outstanding` (written, waiting for their tagged reply).
+- A batch: everything queued when the previous batch is done is written
+  together, and each command is settled by its own tag.  The write is deferred
+  to the end of the turn (`queueMicrotask`), which is what makes "asked for in
+  one turn" mean one batch.
+- Timeouts: `commandTimeout` for a written command, `sessionTimeout` for a
+  session nobody does anything with.
+- IDLE, as a state: `#pump` opens a session when the queue is empty and a
+  reader is holding one, breaks it with DONE when a command asks for the wire,
+  and opens it again once that batch is answered.
 
-- `#tag: number` — auto-incrementing tag counter.
-- `#pending: Map<tag, { resolve, reject, timer }>` — outstanding commands.
-- `#untagged: string[]` — lines accumulated since the current command
-  started (reset per `sendCommand` call).
-- `#dead: boolean` — set when the transport dies.
-- Callbacks: `onUntagged`, `onDead` — single-slot each.
+### The loop
 
-### Public interface
+```
+for await (item of transport.items()) #onItem(item)
+```
+
+`#onItem` routes by kind and by tag: a literal or a continuation belongs to the
+oldest outstanding command; `* BYE` and `ended` fail everything; a tagged line
+settles the command that owns its tag, or the standing session, or — if nobody
+owns it — `onStray`; an untagged line goes to the outstanding command's
+collector and to `onUntagged`, or to the standing session's reader.
+
+`#pump` is the only place anything is written, and it acts on the whole state:
+a batch that is out must be answered first; a standing session may only be
+interrupted with DONE, and only while it is open; a session being entered or
+drained leaves DONE as the only legal line; with nothing queued the session
+opens again, or is dropped when its reader has stopped wanting it.
+
+### Failure
+
+A command nobody answers closes the connection: a late reply would be read as
+the next command's.  The commands that shared its batch are rejected naming the
+one that timed out, rather than reading as a socket that went away on its own.
+`onEnd` reports the reason once.
 
 | Method | Description |
 |---|---|
-| `constructor(transport, defaultTimeout)` | Takes the Transport and wires `transport.onLine`, `transport.onClose`, `transport.onError`. |
-| `sendCommand(cmd)` | Send a tagged command.  Returns untagged lines that arrived before the tagged OK.  Rejects on tagged NO/BAD or timeout. |
-| `nextTag()` | Generate a fresh tag without sending anything.  Used by the Session's `idle()` which manages its own tag lifecycle. |
-| `onUntagged(cb)` | Callback for lines not consumed by a pending tagged command.  The Session layer uses this for mailbox updates, fetch parsing, and idle events. |
-| `onDead(cb)` | Called when the transport dies.  The Session layer uses this to clean up idle resolvers and fetch state. |
-| `dead` | Whether the transport has died. |
-
-### Line dispatch logic
-
-```
-#onLine(line):
-  if line matches RE_TAGGED (A\d+ OK/NO/BAD):
-    if tag is in #pending → resolve/reject the command promise
-    else → forward to onUntagged callback (for idle DONE/OK detection)
-  else:
-    push to #untagged
-    forward to onUntagged callback
-
-#onTransportDead(err):
-  set #dead = true
-  reject all #pending promises
-  fire onDead callback
-```
-
-Unmatched tagged responses (e.g. the IDLE command's tagged OK after the
-DONE handshake) are forwarded to `onUntagged` so the Session layer can
-detect them via `#idleHook`.  This is the only IMAP-specific awareness in
-the dispatcher — all other tagged/untagged routing is generic.
+| `send(cmd, collector)` | Queue a command, collect its reply. |
+| `sendCommand(cmd)` | The same, with the lines collector. |
+| `idle()` | Hold the connection open, yielding the lines the server sends unprompted.  One session at a time. |
+| `onUntagged(cb)` | Lines no command consumed — mailbox updates. |
+| `onStray(cb)` | A tagged line whose command nobody owns. |
+| `onEnd(cb)` | The session stopped, with the reason. |
+| `close()` | Close the socket. |
+| `dead` | Whether the session has stopped taking commands. |
 
 ---
 
-## Layer 3 — Connection setup (`connect.ts`, 190 lines)
+## Layer 3 — Collectors (`collectors.ts`, 77 lines)
 
-**Responsibility:** establish an authenticated IMAP connection.  Creates
-the socket, negotiates TLS/STARTTLS, authenticates with LOGIN, and fetches
-CAPABILITY.  Returns a fully-initialised Transport + CommandDispatcher +
-capabilities set.
+**Responsibility:** how one command's reply is read.  A collector is handed
+every item that arrives while its command is the oldest one outstanding, and
+the tagged OK asks it for the result.
 
-### Exported function
+- `LinesCollector` — the reply as the lines it was; what most commands are.
+- `FetchCollector` — one message per FETCH line, its body from the literal that
+  follows it (or inline).  The FETCH parse used to live in `connection.ts` with
+  a `setImmediate` to guess that the tagged OK had been dispatched.
+
+---
+
+## Layer 4 — Connection setup (`connect.ts`, 187 lines)
+
+**Responsibility:** establish an authenticated connection: socket, TLS or
+STARTTLS, LOGIN, CAPABILITY.
 
 ```ts
 async function connect(
   config: ImapConfig,
   debugEnabled: boolean,
-): Promise<{
-  transport: Transport;
-  dispatcher: CommandDispatcher;
-  capabilities: Set<string>;
-}>
+): Promise<{ transport: Transport; session: Session; capabilities: Set<string> }>
 ```
 
-### Internal flow (sequential async)
-
-1. **`createSocket(config)`** — `tls.connect()` or `new Socket().connect()`
-   with `connTimeout`.  Returns a connected socket.
-
-2. **`waitForGreeting(dispatcher, config)`** — hooks into the dispatcher's
-   `onUntagged` callback.  Waits for the first `* OK` or `* PREAUTH` line.
-   Parses the greeting for `STARTTLS` capability.  Returns
-   `{ starttls: boolean }`.
-
-3. **`starttls(dispatcher, socket, transport, config)`** — sends the
-   STARTTLS command, upgrades the plain socket to TLS via
-   `tls.connect({ socket })`, returns a new Transport and CommandDispatcher
-   wrapping the upgraded socket.  Only called when `autotls` is set and
-   the server advertises STARTTLS.
-
-4. **`login(dispatcher, config)`** — sends `LOGIN` with `authTimeout`.
-   Rejects on timeout or tagged NO/BAD.
-
-5. **`fetchCapabilities(dispatcher, capabilities)`** — sends `CAPABILITY`,
-   parses the response, populates the `capabilities` set.  Best-effort:
-   resolves even if CAPABILITY fails.
-
-### How `Connection` uses it
-
-```ts
-async connect(): Promise<void> {
-    const { transport, dispatcher, capabilities } = await connect(
-      this.#config, this.#debugEnabled,
-    );
-    this.#transport = transport;
-    this.#dispatcher = dispatcher;
-    this.capabilities = capabilities;
-    this.#wireCallbacks();
-}
-```
-
-Nine lines.  `#wireCallbacks()` connects the transport and dispatcher to
-the Session's event handlers (fetch parsing, idle hooks, dead-connection
-cleanup).
+1. `createSocket(config)` — `tls.connect()` or `new Socket().connect()`, under
+   `connTimeout`.
+2. `waitForGreeting(session, config)` — waits on the session's untagged lines
+   for the first `* OK` / `* PREAUTH`, reads STARTTLS out of the greeting's
+   capabilities, and answers `{ starttls, preauth }`.
+3. `starttls(session, socket, transport, debugEnabled, config)` — sends
+   STARTTLS, upgrades the socket with `tls.connect({ socket })`, and returns a
+   new transport and session over the upgraded socket.
+4. `login(session, config)` — `LOGIN`, under `authTimeout`.
+5. `fetchCapabilities(session, capabilities)` — `CAPABILITY`, best effort.
 
 ---
 
-## Layer 4 — Connection / Session (`connection.ts`, 628 lines)
+## Layer 5 — Connection (`connection.ts`, 374 lines)
 
-**Responsibility:** IMAP protocol semantics.  This is the public
-`Connection` class.  Uses `CommandDispatcher` to execute IMAP operations
-and interprets the responses.  Does not touch the socket directly — all
-I/O goes through the dispatcher and transport.
-
-### Public API (unchanged)
+**Responsibility:** what the IMAP operations mean, on top of the session.  This
+is the public API.
 
 ```
 class Connection {
@@ -195,89 +175,56 @@ class Connection {
   serverSupports(cap): boolean
   get dead(): boolean
   setDebug(enabled): void
-  sendCommand(cmd): Promise<string[]>        // delegates to dispatcher
-  sendCommandWithContinuation(cmd): Promise<string>  // sets #continuationResolve
+  sendCommand(cmd): Promise<string[]>
 }
 ```
 
-### Internal structure (~628 lines)
+| Section | Content |
+|---|---|
+| State | `#transport`, `#session`, `#mailboxInfo`, `capabilities` |
+| Debug & lifecycle | `dead`, `setDebug`, `connect`, `close`, `serverSupports`, `sendCommand`, `#live` |
+| Untagged | `#handleUntagged` — EXISTS / RECENT / FLAGS into `#mailboxInfo` |
+| Operations | `openBox` (SELECT/EXAMINE + its lines), `search`, `fetch` (a `FetchCollector`), `addFlags` (STORE), `fetchUnseen` |
+| IDLE events | `idle()` wraps the session's lines as `IdleEvent`s, `#parseIdleEvent` |
+| Search query | `escapeString`, `buildSearchQuery` |
 
-| Section | Lines | Content |
-|---|---|---|
-| State | 38–68 | `#transport`, `#dispatcher`, `#mailboxInfo`, `capabilities`, fetch state, idle state (`#idleHook`, `#idleEventResolve`, `#idleDrainResolve`), `#continuationResolve` |
-| Debug & lifecycle | 80–170 | `dead`, `setDebug`, `#wireCallbacks`, `serverSupports`, `sendCommand`, `sendCommandWithContinuation`, `#sessionUntagged` |
-| Connection setup | 152–172 | `connect()` (9 lines), `close()` (11 lines) |
-| Continuation dispatch | 180–186 | `#onContinue` — resolves `#continuationResolve` on `+` lines |
-| Untagged handlers | 188–260 | `#handleUntagged` (EXISTS/RECENT/FLAGS → `#mailboxInfo`), `#handleFetchLine` + `#onLiteral` + `#maybeFinishFetch` (fetch state machine) |
-| IMAP operations | 262–420 | `openBox`, `search`, `fetch`, `addFlags`, `fetchUnseen` |
-| IDLE | 422–570 | `idle()` async generator, `#parseIdleEvent` |
-| Search utilities | 575–628 | `escapeString`, `buildSearchQuery` |
-
-### Dead-connection handling
-
-`#wireCallbacks()` sets `dispatcher.onDead()` to clean up session-level
-state when the transport dies:
-
-- Resolves `#idleEventResolve(null)` — breaks the idle `while` loop.
-- Resolves `#idleDrainResolve()` — unblocks the idle `finally` block if
-  the socket dies during the DONE/drain phase.
-- Nulls `#idleHook`.
-- Resolves any in-flight `#fetchResolve` with partial results.
-
-The `#idleDrainResolve` field is the last remaining cross-layer coupling:
-it is set during the idle DONE/drain phase and resolved by the socket-close
-path.  Removing it caused hangs when the server closed the socket during
-the drain `await` (see `idle-races.md` race #7).
-
-### IDLE flow
-
-The `idle()` async generator is the most complex single method (~150 lines):
-
-1. Generates a tag via `dispatcher.nextTag()`, sets an idle timeout timer.
-2. Installs `#idleHook` — intercepts all untagged lines and unmatched
-   tagged responses from the dispatcher's `onUntagged` callback.  Parses
-   EXISTS, RECENT, EXPUNGE, FETCH, and FLAGS events.
-3. Creates `firstEventPromise` BEFORE sending the IDLE command so that
-   events arriving synchronously with the `+ idling` continuation are
-   not dropped.
-4. Sends `IDLE` via `sendCommandWithContinuation`, awaits `+ idling`.
-5. Yields parsed events as they arrive.
-6. On `break` / `return()`: sets `done = true`, sends `DONE`, awaits the
-   tagged OK (or socket close via `#idleDrainResolve`), yields any
-   remaining queued events, cleans up.
+`close()` sends LOGOUT and closes the socket in a `finally`, so a server that
+refuses LOGOUT still gets a closed connection.
 
 ---
 
 ## File listing
 
 ```
-vendored/imap-connector/
-├── transport.ts           210 lines   Layer 1 — socket + line/literal framing
-├── dispatch.ts            153 lines   Layer 2 — tagged command dispatch
-├── connect.ts             190 lines   Layer 3 — connection setup
-├── connection.ts          628 lines   Layer 4 — IMAP session (public API)
-├── mock.ts                285 lines   Mock IMAP server for tests
-├── index.ts                 9 lines   Barrel export
-├── interface.ts            55 lines   Shared types (ImapConfig, MailboxInfo, etc.)
-├── connection.test.ts     971 lines   47 tests + 2 todo
-├── test-integration.ts    113 lines   Integration test against real server
-└── docs/
-    ├── architecture.md                 this file
-    ├── design.md                      design decisions
-    ├── roadmap.md                     phased feature plan
-    ├── untested.md                    untested behaviours
-    └── idle-races.md                  IDLE race condition analysis
+src/
+├── transport.ts     253  Layer 1 — socket, framing, the item stream
+├── session.ts       466  Layer 2 — the loop: queue, batches, IDLE, timeouts
+├── collectors.ts     77  Layer 3 — how a reply is read
+├── connect.ts       187  Layer 4 — socket, TLS, LOGIN, CAPABILITY
+├── connection.ts    374  Layer 5 — the public operations
+├── watcher.ts       280  reconnect, catch-up, keepalive, the mail event
+├── interface.ts      55  types
+└── index.ts           8  exports
+test/
+├── transport.test.ts    4 cases
+├── session.test.ts     11 cases
+├── collectors.test.ts   4 cases
+├── connection.test.ts  52 cases + 2 todo
+└── watcher.test.ts     13 cases
+scripts/
+├── imap-server-mock.ts  391  the mock server the connection and watcher suites drive
+└── test-integration.ts  116  against a real server, outside the gate
 ```
 
 ## Cross-layer coupling
 
-One coupling remains: `#idleDrainResolve`.  Set during the idle DONE/drain
-phase, resolved by `#wireCallbacks`'s `onDead` handler when the socket
-closes.  This is necessary because the idle `finally` block `await`s a
-promise that waits for the tagged OK — if the socket dies during that
-`await`, the promise never resolves and the generator hangs.  The
-`#idleDrainResolve` provides an escape hatch.
+What is left, named:
 
-All other coupling is through defined interfaces: Transport exposes
-callbacks, CommandDispatcher exposes `sendCommand`/`onUntagged`/`onDead`,
-the Session never touches the socket directly.
+- `Connection` wires two session hooks (`onUntagged` for mailbox updates) and
+  the transport's `onRawRead` for debug reads.  Both are single-slot.
+- `idle()` in `connection.ts` reads the session's lines and parses them into
+  `IdleEvent`s.  The session does not know what an event is; the connection
+  does not know how a session is opened or broken.
+- A session's guard (`sessionTimeout`) closes the socket, which fails the
+  commands in flight, which is how a forgotten session becomes a dead
+  connection rather than a hung reader.

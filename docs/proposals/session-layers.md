@@ -1,15 +1,51 @@
 # Session layers — a proposal
 
-> Status: **proposal**, 2026-10-14.  Nothing here is built.
-> Scope: the session half of `connection.ts`, the IDLE session, response collection, the
-> watcher's policy hook, and the tests' server double.  The layers below them
-> (`transport.ts`, `dispatch.ts`, `connect.ts`, `interface.ts`) hold what is worth
-> keeping: framing, tags, setup, types.
+> Status: **built**, 2026-10-14.  Slices 1–5 and 7 of "Order of work" are in the tree
+> (commits `051e24e`, `2f3c1fd`, `45a62da`, `e9e388f`, `97d4307`, `68fb059`); slice 6,
+> the watcher as a consumer, was not needed — see "What the build settled".
+> `docs/architecture.md` is the description of what the code is now; this document stays
+> as the design it was built from, and the differences are named below.
 >
-> The shape in this revision is a **session loop**: one generator over the connection,
-> commands queued into it, IDLE one of its states.  It replaces the first draft of the
-> shape section, which kept a dispatcher object with a pending table beside the session
-> and gave each command an assembler.
+> The shape: a **session loop** over the connection, commands queued into it, IDLE one of
+> its states.  It replaces the first draft of this section, which kept a dispatcher object
+> with a pending table beside the session and gave each command an assembler.
+
+## What the build settled
+
+The five questions this proposal left open, answered by building it:
+
+1. **One consumer per connection.**  Not a list: `Session.idle()` refuses a second
+   request (`a session is already open on this connection`) rather than quietly
+   replacing the first.  A second reader would have to be a second connection, which
+   is what the loop exists to avoid needing.
+2. **The watcher did not have to move.**  Its shape (`conn.idle()`, `iterator.next()`,
+   `iterator.return()` on keepalive) fits the loop as it was written.  What changed is
+   what it can now do: a command through `watcher.connection` while the session idles
+   is queued and breaks the session, instead of being refused.  The harness's "flag a
+   message read" path through that connection works because of this, which is why the
+   two-connection workaround it was written with is not needed.
+3. **`markSeen` stays** — a watcher-level policy switch is still the caller's, and the
+   connection can now carry the command for it.  Nothing in this work removed it.
+4. **In order, and one batch per interruption.**  The whole queue is written at once
+   when the previous batch is answered; replies are matched by tag, so pipelining is a
+   later policy of the drain rather than a change of shape.  A command that runs out of
+   time still closes the connection — the reply may be coming and would be read as the
+   next command's — and the commands that shared its batch are rejected naming the one
+   that timed out, so a batch's failure reads as a failure and not as a socket that
+   went away.
+5. **The interruption cost is as stated**: `DONE` + its reply, the batch, then `IDLE` +
+   its continuation.  A reader that holds a session and asks for nothing pays one
+   round trip per interruption and nothing else.
+
+Two differences from the shape as written:
+
+- The files are `session.ts` (the loop, the queue, the standing request) and
+  `collectors.ts` (lines and fetch).  Not a `session/` directory: two files with one
+  job each did not earn a third level, and mailbox and search never became collectors
+  — the connection parses their lines where it asks for them.
+- The session's own timeout (slice 5) landed inside slice 4 rather than after it: the
+  guard that ends a forgotten session was already moving, and leaving it on
+  `commandTimeout` for a commit would have been a deliberate step backwards.
 
 ## What is there now
 
@@ -127,48 +163,53 @@ scenario as an override on top rather than as the source of the rules.
 
 ## Open
 
-1. The standing request: one consumer per connection, or a list with one session?
-2. Where the watcher lives once it is a consumer: its own module, or the caller the
-   docs describe.
-3. With a real policy hook, does `markSeen` still earn its place?
-4. How a batch is issued: in order (the default — simplest to reason about) or pipelined
-   (allowed by IMAP, replies matched by tag, and the server still executes in order).
-   With pipelining, one more decision: a single command's timeout today closes the
-   socket, which takes the rest of the batch with it — keep that, or reject only the one
-   that timed out and let the loop judge whether the wire is still good.
-5. Interruption cost, stated honestly: one interruption per batch pays `DONE` + reply and
-   then `IDLE` + continuation.  The keepalive already does this every 25 s, so it is the
-   loop's normal work — but a chatty consumer should know.
+Still open, now that the shape is built:
+
+1. **Pipelining.**  The batch is written together and matched by tag, which is most of
+   what pipelining needs, but the drain runs one batch to completion before writing the
+   next.  Flipping that is a policy of `#pump`, not a change of shape.
+2. **A command's timeout closes the connection** — the reply may be coming and would be
+   read as the next command's.  A caller that would rather keep the connection could ask
+   the loop to judge the wire instead; nothing in the shape prevents it.
+3. **`connection.ts` parses mailbox and search lines where it asks for them** rather than
+   through collectors.  Two collectors, each reading one command's lines, is honest; a
+   third would be a pattern worth naming.
+4. **`WatcherConfig.markSeen`** still decides what a delivered message means (see "What
+   the build settled" 3).  Nothing in this work moved that decision.
 
 ## Order of work
 
-One slice per red test, smallest first:
+As built, one slice per commit:
 
-1. **The wire rules in the double** — IDLE accepts only `DONE`; anything else is `BAD`
-   on the IDLE tag and unanswered.  (Half of this ships in 0.3.2.)
-2. **The loop skeleton** — the queue, the drain (the whole queue per batch), the table of
-   outstanding commands, collectors, `close`/`error` as items; behaviour unchanged for
-   every existing operation.  Red test: two commands asked for at once run as one batch,
-   in order, with the session interrupted once for both.
-3. **Collectors** — fetch (with literals), mailbox, search move into their own objects.
-4. **IDLE as a state** — the standing request, the events as a stream, the three
-   endings, the tagged reply read by the loop.  Red tests: the two defects of 0.3.1 and
-   0.3.2 become cases in the loop.
-5. **The session's own timeout** — separate from the command deadline.
-6. **The watcher as the consumer** — reconnect, catch-up, keepalive, the policy callback.
-7. **Slim what is left** — `connection.ts` keeps the public operations and the setup,
-   and the dispatcher object either disappears into the loop or stays as a pure
-   line-matching helper with no state of its own.
+1. **The wire rules in the double** — shipped in 0.3.2: the mock enforces the wire, so
+   anything but DONE during an IDLE session is answered `BAD` on the IDLE tag and the
+   offending command is never answered.
+2. **The loop skeleton** — `051e24e` (the transport's item stream) and `2f3c1fd` (the
+   loop: queue, batch, table of outstanding commands, per-command and session timeouts).
+   The red test it asked for is the session suite's first case: two commands asked for in
+   one turn are both written before any reply is read.
+3. **Collectors** — `45a62da`: `LinesCollector` and `FetchCollector`; the fetch parse
+   leaves `connection.ts` with the `setImmediate` guess that the tagged OK had been
+   dispatched.
+4. **IDLE as a state** — `e9e388f`, with slice 5 inside it.
+5. **The session's own timeout** — `e9e388f`: `sessionTimeout` (default 30 s), separate
+   from `commandTimeout`.
+6. **The watcher as the consumer** — not built, because it did not have to be: its shape
+   already fit, and the loop made the command-through-an-idling-connection case work.
+7. **Slim what is left** — `97d4307` (the connection on the loop; `dispatch.ts` deleted;
+   `Connection.sendCommandWithContinuation` removed) and `68fb059` (the transport's
+   single-slot callbacks deleted — the item stream is its only output).
 
 ## Files after
 
 ```
 src/
-├── transport.ts        unchanged: framing, TLS, literals, death — as items
-├── session/loop.ts     the loop, the queue, the standing idle request
-├── session/collect.ts  collectors: fetch, mailbox, search, idle events
-├── connection.ts       the public operations on top of the loop
-├── connect.ts          greeting, STARTTLS, LOGIN, CAPABILITY
-├── watcher.ts          reconnect, catch-up, keepalive, the policy callback
-└── interface.ts        types, one new field (session timeout)
+├── transport.ts     253  framing, TLS, literals, death — as items
+├── session.ts       466  the loop: queue, batches, IDLE as a state, two clocks
+├── collectors.ts     77  how one command's reply is read
+├── connection.ts    374  the public operations on top of the loop
+├── connect.ts       187  greeting, STARTTLS, LOGIN, CAPABILITY
+├── watcher.ts       280  reconnect, catch-up, keepalive, the mail event
+├── interface.ts      55  types
+└── index.ts           8  exports
 ```

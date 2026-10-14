@@ -1,5 +1,13 @@
 # Untested concerns — imap-connector
 
+> **Status, 2026-10-14.**  The line references below are to the architecture
+> before the session loop (`#dispatchLine`, the dispatcher's pending map) — see
+> `docs/architecture.md` for what the files are now.  The judgements still hold:
+> these are the behaviours the suite does not cover.  Two of them the loop's own
+> suite now does: a command's timeout taking the connection down with the
+> commands it was batched with, and what a session does when the server ends it
+> (`test/session.test.ts`).
+
 This document catalogues every behaviour in `connection.ts` that is **not**
 covered by the current unit-test suite (`connection.test.ts`) or the
 integration smoke test (`test-integration.ts`).  Each item includes a
