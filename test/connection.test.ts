@@ -766,6 +766,35 @@ describe('idle', () => {
     server.close();
   });
 
+  it('ends the session when asked to, even with nothing pending', async () => {
+    // A keepalive break happens with no event pending — that is what a keepalive is.
+    // A session that cannot be ended there never sends DONE, so the server waits,
+    // gives up with `BAD Expected DONE`, and the connection is unusable afterwards.
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [{ expect: /^A\d+ IDLE$/, respond: ['+ idling'] }]);
+
+    const iterator = conn.idle()[Symbol.asyncIterator]();
+    const first = iterator.next();
+    await server.idled();
+
+    const ended = await Promise.race([
+      iterator.return?.().then(() => 'ended' as const),
+      new Promise<'still waiting'>((r) => setTimeout(() => r('still waiting'), 1_000)),
+    ]);
+
+    expect(ended).toBe('ended');
+    expect(server.received).toContain('DONE');
+    expect(server.dones).toBe(1);
+    expect(server.badDones).toBe(0);
+
+    // The session is over, and the same connection still answers commands.
+    expect(conn.dead).toBe(false);
+    expect(await conn.search(['UNSEEN'])).toEqual([]);
+
+    void first.catch(() => {});
+    server.close();
+  });
+
   it('yields EXISTS event', async () => {
     const server = await newServer();
     const conn = await connectAndLogin(server, [

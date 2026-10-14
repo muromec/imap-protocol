@@ -30,6 +30,18 @@ export interface ScenarioOptions {
   allowExtra?: boolean;
   /** Greeting sent when a client connects. */
   greeting?: string;
+  /**
+   * Answer every IDLE with a continuation, and idle again after each DONE, forever.
+   * `allowExtra` alone is not enough for a watcher: an IDLE has to be answered with
+   * `+ idling`, never a tagged OK, or the client refuses the continuation.
+   */
+  idleLoop?: boolean;
+  /**
+   * Emulate a server's own IDLE limit: a session that has not sent DONE within this
+   * many milliseconds of its continuation is answered `BAD Expected DONE` — what a
+   * real server does when the client never finishes what it started.
+   */
+  idleLimitMs?: number;
 }
 
 // ── server ─────────────────────────────────────────────────────────────────
@@ -51,6 +63,58 @@ export class MockImapServer {
 
   /** Resolves when the server is listening. */
   readonly listening: Promise<number>;
+
+  /** Every command line the client sent, in order (DONE included). */
+  readonly received: string[] = [];
+  /** How many connections were accepted. */
+  connections = 0;
+  /** How many IDLE sessions the client entered. */
+  idles = 0;
+  /** How many DONE lines arrived. */
+  dones = 0;
+  /** How many IDLE sessions the server gave up on. */
+  badDones = 0;
+
+  #idleWaiters: Array<{ n: number; resolve: () => void }> = [];
+  #outcomeWaiters: Array<(outcome: 'done' | 'bad') => void> = [];
+
+  /** Resolves once the client has entered IDLE `n` times (once by default). */
+  idled(n = 1): Promise<void> {
+    if (this.idles >= n) return Promise.resolve();
+    return new Promise((resolve) => this.#idleWaiters.push({ n, resolve }));
+  }
+
+  /** Resolves with the next end of an IDLE session, and how it ended. */
+  nextIdleOutcome(): Promise<'done' | 'bad'> {
+    return new Promise((resolve) => this.#outcomeWaiters.push(resolve));
+  }
+
+  #noteIdle(): void {
+    this.idles++;
+    const waiting = this.#idleWaiters;
+    this.#idleWaiters = [];
+    for (const waiter of waiting) {
+      if (this.idles >= waiter.n) waiter.resolve();
+      else this.#idleWaiters.push(waiter);
+    }
+  }
+
+  #noteOutcome(outcome: 'done' | 'bad'): void {
+    for (const resolve of this.#outcomeWaiters.splice(0)) resolve(outcome);
+  }
+
+  /** Give the client `idleLimitMs` to send DONE before the server gives up. */
+  #armIdleLimit(tag: string): void {
+    const limit = this.#options.idleLimitMs;
+    if (!limit) return;
+    setTimeout(() => {
+      if (this.#idleTag !== tag) return;
+      this.#idleTag = null;
+      this.badDones++;
+      this.#sendRaw(`${tag} BAD Expected DONE${CRLF}`);
+      this.#noteOutcome('bad');
+    }, limit);
+  }
 
   constructor() {
     this.#server = createServer((socket) => this.#onConnection(socket));
@@ -102,6 +166,7 @@ export class MockImapServer {
 
   #onConnection(socket: Socket): void {
     this.#socket = socket;
+    this.connections++;
     socket.on('data', (chunk: Buffer) => this.#onData(chunk.toString('utf8')));
     socket.on('error', () => {});
     socket.on('close', () => {
@@ -185,10 +250,34 @@ export class MockImapServer {
   // ── command dispatch ───────────────────────────────────────────────────
 
   #handleCommand(cmd: string): void {
+    this.received.push(cmd.trim());
+
+    // A watcher-style run: every IDLE is accepted, every other command is answered,
+    // and a session ends only when DONE arrives — or when the limit above gives up on
+    // it.  CAPABILITY still carries the untagged line the client reads.
+    if (this.#options.idleLoop) {
+      const idleMatch = cmd.match(/^(A\d+) IDLE$/);
+      if (idleMatch) {
+        this.#idleTag = idleMatch[1];
+        this.#sendRaw(`+ idling${CRLF}`);
+        this.#noteIdle();
+        this.#armIdleLimit(idleMatch[1]);
+        return;
+      }
+      const tag = cmd.match(/^(A\d+) /)?.[1];
+      if (tag) {
+        const capabilities =
+          cmd.trim() === `${tag} CAPABILITY` ? `* CAPABILITY IMAP4rev1 UIDPLUS MOVE IDLE${CRLF}` : '';
+        this.#sendRaw(`${capabilities}${tag} OK done${CRLF}`);
+      }
+      return;
+    }
     // DONE is sent without a tag to exit IDLE.  Handle it before the
     // normal scenario-matching logic, since it has no tag and isn't
     // part of the expected step list.
     if (cmd.trim() === 'DONE' && this.#idleTag !== null) {
+      this.dones++;
+      this.#noteOutcome('done');
       this.#sendRaw(`${this.#idleTag} OK IDLE completed` + CRLF);
       this.#idleTag = null;
       if (this.#step >= this.#scenario.length) {
@@ -257,6 +346,8 @@ export class MockImapServer {
 
       // Store tag for when DONE arrives.
       this.#idleTag = tag;
+      this.#noteIdle();
+      this.#armIdleLimit(tag);
       // Don't send tagged OK — the IDLE command stays open until DONE.
       // Don't call #resolveScenario yet — scenario completes on DONE.
       return;

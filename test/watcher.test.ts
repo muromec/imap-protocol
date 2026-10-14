@@ -175,4 +175,34 @@ describe('MailboxWatcher', () => {
 
     watcher.stop();
   });
+
+  it('ends every keepalive cycle with DONE, so the server never gives up on it', async () => {
+    // A server with its own IDLE limit, as a real one has: a session that sends no
+    // DONE within it is answered `BAD Expected DONE` and the connection has to be
+    // rebuilt — which is what the loop did once per cycle before this was fixed.
+    const server = await newServer();
+    server.scenario([], { idleLoop: true, idleLimitMs: 1_500 });
+
+    const watcher = new MailboxWatcher({
+      user: 'test',
+      password: 'secret',
+      host: '127.0.0.1',
+      port: server.port,
+      tls: false,
+      keepaliveInterval: 150,
+      reconnectDelay: 60_000,
+      markSeen: false,
+    });
+
+    // Armed before the loop runs: the first end of an IDLE session decides this case.
+    const outcome = server.nextIdleOutcome();
+    void watcher.start().catch(() => {});
+
+    expect(await outcome).toBe('done');
+    expect(server.dones).toBeGreaterThan(0);
+    expect(server.badDones).toBe(0);
+    expect(server.connections).toBe(1);
+
+    watcher.stop();
+  });
 });
