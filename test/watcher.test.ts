@@ -195,11 +195,16 @@ describe('MailboxWatcher', () => {
     });
 
     // Armed before the loop runs: the first end of an IDLE session decides this case.
-    const outcome = server.nextIdleOutcome();
+    // The deadline is only a guard — it fails here, naming what it waited for, rather
+    // than at the runner's clock.
+    const verdict = Promise.race([
+      server.nextIdleOutcome(),
+      new Promise<'none'>((r) => setTimeout(() => r('none'), 3_000)),
+    ]);
     void watcher.start().catch(() => {});
 
-    expect(await outcome).toBe('done');
-    expect(server.dones).toBeGreaterThan(0);
+    const outcome = await verdict;
+    expect(`saw ${outcome}; commands: ${server.received.join(' | ')}`).toMatch(/^saw done;/);
     expect(server.badDones).toBe(0);
     expect(server.connections).toBe(1);
 

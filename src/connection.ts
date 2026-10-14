@@ -392,122 +392,141 @@ export class Connection {
   /**
    * Enter IDLE mode and yield real-time mailbox events.
    *
-   * The caller must iterate with `for await (const event of conn.idle())`.
-   * Breaking out of the loop (or calling `.return()` on the iterator) sends
-   * DONE and drains remaining untagged events before resolving.
+   * The caller iterates with `for await (const event of conn.idle())`.  Breaking out
+   * of the loop — or calling `.return()` on the iterator — sends DONE, waits for the
+   * session's tagged OK, and leaves the connection usable.
+   *
+   * The iterator is written by hand rather than as a generator on purpose.  A
+   * generator parked on its event wait cannot be interrupted: `return()` is queued
+   * behind that await, which settles only when the server says something, and a
+   * keepalive break is made exactly when it does not.  The DONE would then never be
+   * sent, and the server would break the session off instead.
    *
    * Throws if the server does not advertise the IDLE capability.
    */
-  async *idle(): AsyncIterable<IdleEvent> {
+  idle(): AsyncIterable<IdleEvent> {
     if (!this.serverSupports('IDLE')) {
       throw new Error('Server does not support IDLE');
     }
 
-    // Tag for this IDLE session.  We do NOT register it in the
-    // dispatcher's pending map — that would cause the dispatcher to
-    // consume the tagged OK instead of forwarding it to the idle hook.
-    this.#idleTag = this.#dispatcher!.nextTag();
-    const idleTimer = setTimeout(() => {
-      this.#transport?.close();
-    }, this.#config.commandTimeout ?? 30_000);
+    // Tag for this IDLE session.  We do NOT register it in the dispatcher's pending
+    // map — that would cause the dispatcher to consume the tagged OK instead of
+    // forwarding it to the idle hook.
+    const idleTag = this.#dispatcher!.nextTag();
+    this.#idleTag = idleTag;
 
-    // Install the idle hook BEFORE sending the command so we catch
-    // events that arrive synchronously with the server response.
+    let started = false;
+    let ended = false;
+    let ending: Promise<void> | null = null;
     let eventResolve: ((ev: IdleEvent | null) => void) | null = null;
-    const eventQueue: IdleEvent[] = [];
-    let done = false;
-
-    const pushIdleEvent = (ev: IdleEvent) => {
-      if (done) {
-        eventQueue.push(ev);
-      } else if (eventResolve) {
-        eventResolve(ev);
-        eventResolve = null;
-      }
-    };
-
     let drainResolve: (() => void) | null = null;
-    const idleTag = this.#idleTag;
+    const pending: IdleEvent[] = [];
 
-    this.#idleHook = (line: string) => {
-      this.#debug('idle', line);
-      const tagged = line.match(RE_TAGGED);
-      if (tagged) {
-        if (tagged[1] === idleTag) {
-          clearTimeout(idleTimer);
-          this.#idleHook = null;
-          if (drainResolve) drainResolve();
-        }
-        return;
-      }
-      const ev = this.#parseIdleEvent(line);
-      if (ev) pushIdleEvent(ev);
+    const pushIdleEvent = (ev: IdleEvent): void => {
+      const resolve = eventResolve;
+      eventResolve = null;
+      if (resolve !== null && !ended) resolve(ev);
+      else pending.push(ev);
     };
 
-    // Set eventResolve BEFORE sending IDLE so we catch events that
-    // arrive synchronously with the continuation response.
-    let firstEventPromise = new Promise<IdleEvent | null>((resolve) => {
-      eventResolve = resolve;
-      this.#idleEventResolve = resolve;
-    });
-
-    // Send IDLE and wait for continuation.
-    const continuationPromise: Promise<string> = new Promise((resolve) => {
+    const continuations = new Promise<string>((resolve) => {
       this.#continuationResolve = resolve;
     });
-    this.#transport!.send(this.#idleTag + ' IDLE');
 
-    const contLine = await continuationPromise;
-    if (!contLine.startsWith('+')) {
-      this.#idleHook = null;
-      this.#idleEventResolve = null;
-      throw new Error(`Expected continuation, got: ${contLine}`);
-    }
+    /**
+     * Send DONE once, wait for the tagged OK, and let a waiting reader finish.
+     *
+     * Idempotent, because a caller that breaks out of the loop and a socket that goes
+     * away both ask for the same ending.
+     */
+    const end = (): Promise<void> => {
+      if (ending !== null) return ending;
+      ended = true;
 
-    // Yield events as they arrive.
-    try {
-      let first = true;
-      while (true) {
-        const event = await (first
-          ? firstEventPromise
-          : new Promise<IdleEvent | null>((resolve) => {
-              eventResolve = resolve;
-              this.#idleEventResolve = resolve;
-            }));
-        first = false;
-        if (event === null) break;
-        yield event;
-      }
-    } finally {
-      done = true;
+      const waiting = eventResolve;
+      eventResolve = null;
+      waiting?.(null);
 
-      // If the socket is already closed, skip DONE/drain — there's
-      // nothing to send to and the tagged OK will never arrive.
-      if (this.#idleHook != null && this.#transport != null) {
-        // Send DONE
-        try {
-          this.#transport.send('DONE');
-
-          // Drain: wait for tagged OK for IDLE
-          await new Promise<void>((resolve) => {
-            drainResolve = resolve;
-            this.#idleDrainResolve = resolve;
-          });
-
-          // Yield any events that arrived after DONE but before tagged OK.
-          for (const ev of eventQueue) {
-            yield ev;
+      ending = (async () => {
+        // A socket that is already gone takes no DONE and answers none.
+        if (this.#idleHook != null && this.#transport != null) {
+          try {
+            this.#transport.send('DONE');
+            await new Promise<void>((resolve) => {
+              drainResolve = resolve;
+              this.#idleDrainResolve = resolve;
+            });
+          } catch (err) {
+            this.#debug('idle', 'DONE/drain failed', err);
           }
-        } catch (err) {
-          console.error(new Error('Unhandled error in idle finally', { cause: err }));
         }
-      }
+        this.#idleHook = null;
+        this.#idleEventResolve = null;
+        this.#idleDrainResolve = null;
+      })();
+      return ending;
+    };
 
-      // Clean up idle state.
-      this.#idleHook = null;
-      this.#idleEventResolve = null;
-      this.#idleDrainResolve = null;
-    }
+    const start = async (): Promise<void> => {
+      started = true;
+
+      // While IDLE is open the server may say nothing at all, so this is the only
+      // thing that ends a session its caller forgot about.
+      const idleTimer = setTimeout(() => {
+        this.#transport?.close();
+      }, this.#config.commandTimeout ?? 30_000);
+
+      // Install the idle hook BEFORE sending the command so we catch events that
+      // arrive synchronously with the server response.
+      this.#idleHook = (line: string) => {
+        this.#debug('idle', line);
+        const tagged = line.match(RE_TAGGED);
+        if (tagged) {
+          if (tagged[1] === idleTag) {
+            clearTimeout(idleTimer);
+            this.#idleHook = null;
+            drainResolve?.();
+          }
+          return;
+        }
+        const ev = this.#parseIdleEvent(line);
+        if (ev) pushIdleEvent(ev);
+      };
+
+      this.#transport!.send(`${idleTag} IDLE`);
+      const continuation = await continuations;
+      if (!continuation.startsWith('+')) {
+        clearTimeout(idleTimer);
+        this.#idleHook = null;
+        this.#idleEventResolve = null;
+        throw new Error(`Expected continuation, got: ${continuation}`);
+      }
+    };
+
+    const iterator: AsyncIterator<IdleEvent> = {
+      next: async (): Promise<IteratorResult<IdleEvent>> => {
+        if (!started) await start();
+
+        const queued = pending.shift();
+        if (queued !== undefined) return { done: false, value: queued };
+        if (ended) return { done: true, value: undefined };
+
+        const event = await new Promise<IdleEvent | null>((resolve) => {
+          eventResolve = resolve;
+          this.#idleEventResolve = resolve;
+        });
+        // null: the session is over — the caller asked for it, or the socket went.
+        if (event == null) return { done: true, value: undefined };
+        return { done: false, value: event };
+      },
+
+      return: async (): Promise<IteratorResult<IdleEvent>> => {
+        await end();
+        return { done: true, value: undefined };
+      },
+    };
+
+    return { [Symbol.asyncIterator]: () => iterator };
   }
 
   // Tag of the current IDLE command, set when idle() is called.

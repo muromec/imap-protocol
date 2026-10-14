@@ -116,6 +116,16 @@ export class MockImapServer {
     }, limit);
   }
 
+  /** The untagged lines a command needs before its tagged OK, standing in for a real server. */
+  #untaggedFor(tag: string, line: string): string {
+    if (line === `${tag} CAPABILITY`) return `* CAPABILITY IMAP4rev1 UIDPLUS MOVE IDLE${CRLF}`;
+    if (line === `${tag} SELECT "INBOX"` || line === `${tag} SELECT INBOX`) {
+      return `* 0 EXISTS${CRLF}* OK [UIDVALIDITY 1] done${CRLF}`;
+    }
+    if (line.startsWith(`${tag} UID SEARCH `)) return `* SEARCH${CRLF}`;
+    return '';
+  }
+
   constructor() {
     this.#server = createServer((socket) => this.#onConnection(socket));
 
@@ -252,6 +262,20 @@ export class MockImapServer {
   #handleCommand(cmd: string): void {
     this.received.push(cmd.trim());
 
+    // DONE is sent without a tag to exit IDLE.  Handle it here, before the
+    // watcher-style branch and the scenario matching below: it has no tag and is not
+    // part of the expected step list.
+    if (cmd.trim() === 'DONE' && this.#idleTag !== null) {
+      this.dones++;
+      this.#noteOutcome('done');
+      this.#sendRaw(`${this.#idleTag} OK IDLE completed` + CRLF);
+      this.#idleTag = null;
+      if (this.#step >= this.#scenario.length) {
+        this.#resolveScenario?.();
+      }
+      return;
+    }
+
     // A watcher-style run: every IDLE is accepted, every other command is answered,
     // and a session ends only when DONE arrives — or when the limit above gives up on
     // it.  CAPABILITY still carries the untagged line the client reads.
@@ -266,22 +290,8 @@ export class MockImapServer {
       }
       const tag = cmd.match(/^(A\d+) /)?.[1];
       if (tag) {
-        const capabilities =
-          cmd.trim() === `${tag} CAPABILITY` ? `* CAPABILITY IMAP4rev1 UIDPLUS MOVE IDLE${CRLF}` : '';
-        this.#sendRaw(`${capabilities}${tag} OK done${CRLF}`);
-      }
-      return;
-    }
-    // DONE is sent without a tag to exit IDLE.  Handle it before the
-    // normal scenario-matching logic, since it has no tag and isn't
-    // part of the expected step list.
-    if (cmd.trim() === 'DONE' && this.#idleTag !== null) {
-      this.dones++;
-      this.#noteOutcome('done');
-      this.#sendRaw(`${this.#idleTag} OK IDLE completed` + CRLF);
-      this.#idleTag = null;
-      if (this.#step >= this.#scenario.length) {
-        this.#resolveScenario?.();
+        const untagged = this.#untaggedFor(tag, cmd.trim());
+        this.#sendRaw(`${untagged}${tag} OK done${CRLF}`);
       }
       return;
     }
