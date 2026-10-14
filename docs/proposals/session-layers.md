@@ -65,10 +65,13 @@ for await (const item of transport.items()) {
 
 - **Writes belong to the loop.**  Nobody else touches the transport, so nobody else can
   put a line on the wire while the loop is in the middle of something.
-- **One command is outstanding at a time.**  A queue entry is
-  `{ cmd, collector, deadline, resolve }`.  One slot replaces the pending map: the
-  single-threaded shape is what makes the map unnecessary, and the map was only safe
-  for one command anyway (`#untagged` is a single array that each `sendCommand` resets).
+- **A batch, and a table of what is outstanding.**  A queue entry is
+  `{ cmd, collector, deadline, resolve }`.  Draining takes the whole queue, so a batch
+  costs one interruption of the session rather than one per command, and replies are
+  matched by tag from a small table the loop owns — the table the single-thread shape
+  had removed, safe again because there is one writer and one resolver.  Whether a
+  batch's commands are issued in order or pipelined is a policy, not a property: the
+  table serves one entry either way.
 - **A collector is how a command's lines are read**: `FETCH` responses with literals,
   a mailbox's lines, search uids, `IDLE` events.  Collectors are objects with one
   method (`line(item)`, and `done`), so the idle event parser stops being special.
@@ -83,8 +86,8 @@ queue is empty, and the consumer still wants the session.
 - Re-entering IDLE is a **standing request** held by the consumer — the watcher asks for
   a session and gives it a sink for events; while that request stands and nothing is
   queued, the loop idles.
-- A queued command breaks the session: `DONE`, the tagged reply, the command, then back
-  to IDLE if the request still stands.  This answers the queued-or-refused question by
+- The queue breaks the session: `DONE`, the tagged reply, the batch, then back to IDLE
+  once if the request still stands.  This answers the queued-or-refused question by
   construction: **queued**, in the one place that knows when the window closes.
 - When the consumer drops the request, the loop stops idling and the connection is just
   a connection again.
@@ -118,9 +121,8 @@ scenario as an override on top rather than as the source of the rules.
 - No new IMAP operations.  `roadmap.md`'s batches 4–8 stay parked.
 - No change to the public operation signatures (`connect`, `close`, `openBox`,
   `search`, `fetch`, `addFlags`, `fetchUnseen`, `idle`).
-- **No pipelining.**  Two commands in flight is legal IMAP; the loop gives that up,
-  deliberately, because nothing here can use it safely today and the arbitration is
-  what all of the above defects were about.
+- No decision about how a batch is issued: in order and pipelined both fit the same
+  table, in-order being the simpler default.  Open 4 carries it.
 - No second connection anywhere: the point of the loop is that one is enough.
 
 ## Open
@@ -129,9 +131,14 @@ scenario as an override on top rather than as the source of the rules.
 2. Where the watcher lives once it is a consumer: its own module, or the caller the
    docs describe.
 3. With a real policy hook, does `markSeen` still earn its place?
-4. Interruption cost, stated honestly: each command that breaks a session pays `DONE` +
-   reply and then `IDLE` + continuation.  The keepalive already does this every 25 s, so
-   it is the loop's normal work — but a chatty consumer should know.
+4. How a batch is issued: in order (the default — simplest to reason about) or pipelined
+   (allowed by IMAP, replies matched by tag, and the server still executes in order).
+   With pipelining, one more decision: a single command's timeout today closes the
+   socket, which takes the rest of the batch with it — keep that, or reject only the one
+   that timed out and let the loop judge whether the wire is still good.
+5. Interruption cost, stated honestly: one interruption per batch pays `DONE` + reply and
+   then `IDLE` + continuation.  The keepalive already does this every 25 s, so it is the
+   loop's normal work — but a chatty consumer should know.
 
 ## Order of work
 
@@ -139,9 +146,10 @@ One slice per red test, smallest first:
 
 1. **The wire rules in the double** — IDLE accepts only `DONE`; anything else is `BAD`
    on the IDLE tag and unanswered.  (Half of this ships in 0.3.2.)
-2. **The loop skeleton** — one command slot, a queue, collectors, `close`/`error` as
-   items; behaviour unchanged for every existing operation.  Red test: two commands
-   asked for at once run one after the other, in order.
+2. **The loop skeleton** — the queue, the drain (the whole queue per batch), the table of
+   outstanding commands, collectors, `close`/`error` as items; behaviour unchanged for
+   every existing operation.  Red test: two commands asked for at once run as one batch,
+   in order, with the session interrupted once for both.
 3. **Collectors** — fetch (with literals), mailbox, search move into their own objects.
 4. **IDLE as a state** — the standing request, the events as a stream, the three
    endings, the tagged reply read by the loop.  Red tests: the two defects of 0.3.1 and
