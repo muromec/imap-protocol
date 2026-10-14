@@ -1,10 +1,15 @@
 # Session layers — a proposal
 
 > Status: **proposal**, 2026-10-14.  Nothing here is built.
-> Scope: the session half of `connection.ts`, the IDLE session, the fetch response
-> assembler, the watcher's policy hook, and the tests' server double.  The four layers
-> below them (`transport.ts`, `dispatch.ts`, `connect.ts`, `interface.ts`) are healthy
-> and stay as they are.
+> Scope: the session half of `connection.ts`, the IDLE session, response collection, the
+> watcher's policy hook, and the tests' server double.  The layers below them
+> (`transport.ts`, `dispatch.ts`, `connect.ts`, `interface.ts`) hold what is worth
+> keeping: framing, tags, setup, types.
+>
+> The shape in this revision is a **session loop**: one generator over the connection,
+> commands queued into it, IDLE one of its states.  It replaces the first draft of the
+> shape section, which kept a dispatcher object with a pending table beside the session
+> and gave each command an assembler.
 
 ## What is there now
 
@@ -27,7 +32,7 @@ five, and they are one problem — IDLE is a parallel command path:
 4. `#idleEventResolve` (`:62`) and `#idleDrainResolve` (`:66`) are promises the
    socket-close path resolves from outside the session.
 5. `#fetchResolve` (`:50`) with `#handleFetchLine` (`:212`), `#onLiteral` (`:253`) and
-   `#maybeFinishFetch` (`:267`) is a response assembler living in the session.
+   `#maybeFinishFetch` (`:267`) is a response collector living in the session.
 
 Three consequences, each measured against a real provider:
 
@@ -36,95 +41,97 @@ Three consequences, each measured against a real provider:
 - A consumer that decides a message's fate after a handover — the `\Seen` flag — has to
   ride a connection it does not own, and that connection is idling or dying nearly all
   the time.
-- Two defects in one evening came out of this: the break in a session sent no DONE at
-  all (a generator parked on an event wait cannot be interrupted), and a session the
-  server ended left its reader waiting for an event that never came.
+- Three defects in one evening came out of this: the break in a session sent no DONE at
+  all, a session the server ended left its reader waiting, and a command sent during a
+  session was swallowed by the hook.
 
 `docs/idle-races.md` §3 states the rule the code then broke: *"IDLE MUST reuse
 `sendCommand` … if IDLE uses a custom promise mechanism, the tagged OK would be
-unmatched and silently ignored, causing the iterator to hang."*  Everything below is
-that rule given a place to live.
+unmatched and silently ignored, causing the iterator to hang."*  The loop below is that
+rule made structural.
 
 ## The shape
 
-### 1. One pending table (dispatch.ts, unchanged in shape)
+### 1. One loop over the connection
 
-IDLE takes its tag from the same counter and registers it in the same table as every
-other command.  A reply to the IDLE tag is matched by the mechanism that matches every
-reply, so `#idleHook` has nothing to swallow.  `nextTag()` goes away with the last
-caller that wanted a tag nobody held.
+A session is a generator that reads the wire and serves a queue:
 
-### 2. Assemblers, not callbacks (new)
+```
+for await (const item of transport.items()) {
+  // item: a line, a literal chunk, or "the connection ended"
+  // serve the current command's collector, or idle, or take the next queued command
+}
+```
 
-Interpreting a response is a small object with one job, registered for the life of one
-command and dropped with it:
+- **Writes belong to the loop.**  Nobody else touches the transport, so nobody else can
+  put a line on the wire while the loop is in the middle of something.
+- **One command is outstanding at a time.**  A queue entry is
+  `{ cmd, collector, deadline, resolve }`.  One slot replaces the pending map: the
+  single-threaded shape is what makes the map unnecessary, and the map was only safe
+  for one command anyway (`#untagged` is a single array that each `sendCommand` resets).
+- **A collector is how a command's lines are read**: `FETCH` responses with literals,
+  a mailbox's lines, search uids, `IDLE` events.  Collectors are objects with one
+  method (`line(item)`, and `done`), so the idle event parser stops being special.
+- **Ending the connection is an item**, not a callback.  `close` and `error` are pushed
+  into the same stream, or the loop is back to promises resolved from outside it.
 
-- `FetchAssembler` — collects `FETCH` responses, literals included, into
-  `FetchedMessage[]`.
-- `IdleAssembler` — parses `EXISTS` / `RECENT` / `EXPUNGE` / `FETCH` / `FLAGS` into
-  `IdleEvent`, and holds the events that arrive before a reader asks for them.
+### 2. IDLE is a state of the loop, not a command with a hook
 
-They see only their own command's lines.  This is today's `#handleFetchLine` /
-`#parseIdleEvent` code, moved out and given a boundary.
+The loop is either running a command or idling.  Idling means: a session is open, the
+queue is empty, and the consumer still wants the session.
 
-### 3. `IdleSession` (new module)
+- Re-entering IDLE is a **standing request** held by the consumer — the watcher asks for
+  a session and gives it a sink for events; while that request stands and nothing is
+  queued, the loop idles.
+- A queued command breaks the session: `DONE`, the tagged reply, the command, then back
+  to IDLE if the request still stands.  This answers the queued-or-refused question by
+  construction: **queued**, in the one place that knows when the window closes.
+- When the consumer drops the request, the loop stops idling and the connection is just
+  a connection again.
+- Only the loop knows the session is open, so "only `DONE` may be sent while idling" is
+  its state rather than a rule each caller has to remember.
 
-An object with states — `entering` → `idling` → `ending` → `ended` — rather than flags
-scattered across a class:
+### 3. Two clocks
 
-- `begin()` sends IDLE through the dispatcher and awaits the continuation.
-- the iterator yields `IdleEvent`s; `return()` sends DONE once, awaits the tagged
-  reply, and ends the session.
-- the session ends on its own `return()`, on the tagged reply (an `OK` for a DONE, or a
-  `NO`/`BAD` from a server that ended it first), or on the socket dying — and every one
-  of those endings finishes the reader.
-- the idle timeout is its own field.  Today it is `commandTimeout`, so a session is cut
-  off after 30 s of quiet, which is the only reason the default keepalive is 25 s.
+A queued command has a deadline.  A session has its own timeout.  Today both are
+`commandTimeout`, which is why a quiet session looks like a failed command and why the
+default keepalive is 25 s.  They are different things: quiet is what a session *is*.
 
-### 4. One rule about commands during a session (the session's job)
+### 4. The consumer above
 
-The session — not each caller — knows that `DONE` is the only line a client may send
-while a session idles.  A command asked for in that window takes one of two shapes, and
-this proposal leaves the choice open:
+The watcher is a consumer of the session, not a second session manager: reconnect,
+catch-up fetch and keepalive cycling stay; the decision about what a delivered message
+means becomes a callback its owner supplies, instead of a `markSeen` boolean that makes
+a consumer reach into a connection it does not own.
 
-- **queued**: it waits, the session ends, the command runs, the session resumes;
-- **refused**: it rejects with a sentence naming the session.
+### 5. The tests' double as a server, not a script
 
-*Queued* is the shape that fits the layer: a caller cannot know when the window closes,
-and the session can.  Its cost is that a command may wait up to the idle timeout; the
-refusal makes that visible instead.  A refusal is what ships today (0.3.2), as the
-stopgap that stops a caller feeding a session a line that kills it.
-
-### 5. Policy above the session
-
-The watcher is a caller of the session, not a second session manager.  Reconnect,
-catch-up fetch and keepalive cycling stay.  The decision about what a delivered message
-means — today the `markSeen` boolean, which makes a consumer reach into a connection —
-becomes a callback the watcher's owner supplies, and the command it needs is one the
-session serves like any other.
-
-### 6. The mock as a server, not a script
-
-Today the tests' double replays a scenario, and the rules of the wire are copied into
-each test; when a defect turns up, the next option is bolted on (`idleLimitMs`,
-`idleLoop` and counters were added for the two IDLE defects).  What ends that growth is
-one small model that knows the words — greeting, `LOGIN`, `CAPABILITY`, `SELECT`,
-`IDLE` (only `DONE` accepted, `BAD Expected DONE` otherwise), `BYE`, tagged replies —
-with a scenario as an override on top rather than as the source of the rules.
+Today the double replays a scenario, and the rules of the wire are copied into each
+test; when a defect turns up, the next option is bolted on (`idleLimitMs`, `idleLoop`
+and counters were added for the two IDLE defects).  What ends that growth is one small
+model that knows the words — greeting, `LOGIN`, `CAPABILITY`, `SELECT`, `IDLE` (only
+`DONE` accepted, `BAD Expected DONE` otherwise), `BYE`, tagged replies — with a
+scenario as an override on top rather than as the source of the rules.
 
 ## What it does not do
 
 - No new IMAP operations.  `roadmap.md`'s batches 4–8 stay parked.
 - No change to the public operation signatures (`connect`, `close`, `openBox`,
   `search`, `fetch`, `addFlags`, `fetchUnseen`, `idle`).
-- No decision on queued-versus-refused; it is named and left open.
-- No second connection anywhere: the point of (1)–(4) is that one is enough.
+- **No pipelining.**  Two commands in flight is legal IMAP; the loop gives that up,
+  deliberately, because nothing here can use it safely today and the arbitration is
+  what all of the above defects were about.
+- No second connection anywhere: the point of the loop is that one is enough.
 
 ## Open
 
-1. Queued or refused for a command during a session.
-2. Where the watcher lives: its own module above the session, or a documented caller?
+1. The standing request: one consumer per connection, or a list with one session?
+2. Where the watcher lives once it is a consumer: its own module, or the caller the
+   docs describe.
 3. With a real policy hook, does `markSeen` still earn its place?
+4. Interruption cost, stated honestly: each command that breaks a session pays `DONE` +
+   reply and then `IDLE` + continuation.  The keepalive already does this every 25 s, so
+   it is the loop's normal work — but a chatty consumer should know.
 
 ## Order of work
 
@@ -132,25 +139,28 @@ One slice per red test, smallest first:
 
 1. **The wire rules in the double** — IDLE accepts only `DONE`; anything else is `BAD`
    on the IDLE tag and unanswered.  (Half of this ships in 0.3.2.)
-2. **IDLE's tag in the pending table** — the hook stops swallowing tagged lines; the
-   red test is a command during IDLE that must not eat another command's reply.
-3. **The idle timeout as its own field** — a session may outlive the command timeout.
-4. **`IdleSession`** — states, iterator, the three endings; `idle()` returns it.
-5. **`FetchAssembler`** — the fetch state machine out of the session.
-6. **Commands during a session** — whichever shape Open 1 settles on, in one place.
-7. **The watcher's callback** — the decision at the caller, the connection no longer
-   handed out for it.
+2. **The loop skeleton** — one command slot, a queue, collectors, `close`/`error` as
+   items; behaviour unchanged for every existing operation.  Red test: two commands
+   asked for at once run one after the other, in order.
+3. **Collectors** — fetch (with literals), mailbox, search move into their own objects.
+4. **IDLE as a state** — the standing request, the events as a stream, the three
+   endings, the tagged reply read by the loop.  Red tests: the two defects of 0.3.1 and
+   0.3.2 become cases in the loop.
+5. **The session's own timeout** — separate from the command deadline.
+6. **The watcher as the consumer** — reconnect, catch-up, keepalive, the policy callback.
+7. **Slim what is left** — `connection.ts` keeps the public operations and the setup,
+   and the dispatcher object either disappears into the loop or stays as a pure
+   line-matching helper with no state of its own.
 
 ## Files after
 
 ```
 src/
-├── transport.ts        unchanged
-├── dispatch.ts         unchanged in shape, plus the assembler registry
-├── connect.ts          unchanged
-├── connection.ts       session: login, mailbox, typed operations
-├── session/idle.ts     IdleSession: the state machine and its iterator
-├── session/fetch.ts    FetchAssembler
+├── transport.ts        unchanged: framing, TLS, literals, death — as items
+├── session/loop.ts     the loop, the queue, the standing idle request
+├── session/collect.ts  collectors: fetch, mailbox, search, idle events
+├── connection.ts       the public operations on top of the loop
+├── connect.ts          greeting, STARTTLS, LOGIN, CAPABILITY
 ├── watcher.ts          reconnect, catch-up, keepalive, the policy callback
-└── interface.ts        types, one new field (idleTimeout)
+└── interface.ts        types, one new field (session timeout)
 ```
