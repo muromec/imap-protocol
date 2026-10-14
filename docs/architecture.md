@@ -6,6 +6,12 @@ Transport, CommandDispatcher, connection setup, and the session layer.
 
 Tests: `connection.test.ts` — 47 passed, 2 todo (vitest, ~3s).
 
+> **Open proposal on the session layer** — `docs/proposals/session-layers.md`
+> (2026-10-14).  It names the five cross-layer couplings this document counts as one,
+> and the shape that removes them: IDLE as a command of the pending table, response
+> assemblers as their own objects, the rule about commands during a session in one
+> place, and the tests' double as a server model rather than a scenario.
+
 ---
 
 ## Layer 1 — Transport (`transport.ts`, 210 lines)
