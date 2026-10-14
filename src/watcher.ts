@@ -200,6 +200,9 @@ export class MailboxWatcher extends EventTarget {
               existingTotal = count;
               if (arrived > 0) {
                 idleEnded = true;
+                // A session left without DONE keeps standing on the wire: end it
+                // here, as every other exit does, before the fetch.
+                await iterator.return?.();
                 return; // exit to fetch below
               }
               break;
