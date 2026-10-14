@@ -89,6 +89,12 @@ export class MockImapServer {
     return new Promise((resolve) => this.#outcomeWaiters.push(resolve));
   }
 
+  /** Say something nobody asked for: a mailbox update arriving while a session
+   *  stands.  This is how a test makes mail arrive during IDLE. */
+  deliver(line: string): void {
+    this.#sendRaw(line + CRLF);
+  }
+
   #noteIdle(): void {
     this.idles++;
     const waiting = this.#idleWaiters;

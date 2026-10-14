@@ -210,4 +210,48 @@ describe('MailboxWatcher', () => {
 
     watcher.stop();
   });
+
+  it('ends the session it was in before fetching mail that arrived during it', async () => {
+    // A session left without DONE keeps standing on the wire, and the connection
+    // refuses the next one — so the loop dies the next time round.  Both halves are
+    // asserted: the session is ended, and the loop goes on.
+    const server = await newServer();
+    server.scenario([], { idleLoop: true });
+
+    const watcher = new MailboxWatcher({
+      user: 'test',
+      password: 'secret',
+      host: '127.0.0.1',
+      port: server.port,
+      tls: false,
+      keepaliveInterval: 60_000,
+      reconnectDelay: 60_000,
+      markSeen: false,
+    });
+
+    const errors: string[] = [];
+    watcher.on('error', (event) => {
+      if (event.error) errors.push(event.error.message);
+    });
+
+    void watcher.start().catch(() => {});
+    await server.idled(1);
+
+    // Mail arrives while the session stands, the way a real server says so.
+    server.deliver('* 3 EXISTS');
+
+    // The loop ends that session through DONE, fetches, and opens another.  The
+    // deadline is a guard: it fails here, naming what was waited for, rather than at
+    // the runner's clock.
+    const round = await Promise.race([
+      server.idled(2).then(() => 'second session'),
+      new Promise<'none'>((r) => setTimeout(() => r('none'), 2_000)),
+    ]);
+    expect(
+      `round: ${round}; errors: [${errors.join(', ')}]; commands: ${server.received.join(' | ')}`,
+    ).toMatch(/^round: second session; errors: \[\]; .*DONE \| A\d+ UID SEARCH UNSEEN \| A\d+ IDLE$/);
+    expect(server.connections).toBe(1);
+
+    watcher.stop();
+  });
 });
