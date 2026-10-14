@@ -65,6 +65,11 @@ export class Connection {
   // so the finally block doesn't hang if the socket dies mid-drain.
   #idleDrainResolve: (() => void) | null = null;
 
+  // Whether an IDLE session is in flight.  While one is, the only line a client may
+  // send is DONE — anything else and the server ends the session over it, leaving the
+  // command unanswered (see sendCommand).
+  #idling = false;
+
   /** Whether the connection has been closed or has errored out. */
   get dead(): boolean {
     return this.#dispatcher?.dead ?? true;
@@ -104,6 +109,7 @@ export class Connection {
         this.#idleDrainResolve = null;
       }
       this.#idleHook = null;
+      this.#idling = false;
       if (this.#fetchResolve) {
         const r = this.#fetchResolve;
         this.#fetchResolve = null;
@@ -124,6 +130,11 @@ export class Connection {
   // ── protocol helpers (delegate to dispatcher) ─────────────────────────
 
   sendCommand(cmd: string): Promise<string[]> {
+    if (this.#idling) {
+      return Promise.reject(
+        new Error('this connection is in an IDLE session; finish it before another command'),
+      );
+    }
     return this.#dispatcher!.sendCommand(cmd);
   }
 
@@ -433,6 +444,15 @@ export class Connection {
       this.#continuationResolve = resolve;
     });
 
+    /** Let a waiting reader finish: the session is over, whatever ended it. */
+    const finish = (): void => {
+      ended = true;
+
+      const waiting = eventResolve;
+      eventResolve = null;
+      waiting?.(null);
+    };
+
     /**
      * Send DONE once, wait for the tagged OK, and let a waiting reader finish.
      *
@@ -441,11 +461,8 @@ export class Connection {
      */
     const end = (): Promise<void> => {
       if (ending !== null) return ending;
-      ended = true;
-
-      const waiting = eventResolve;
-      eventResolve = null;
-      waiting?.(null);
+      this.#idling = false;
+      finish();
 
       ending = (async () => {
         // A socket that is already gone takes no DONE and answers none.
@@ -485,6 +502,11 @@ export class Connection {
           if (tagged[1] === idleTag) {
             clearTimeout(idleTimer);
             this.#idleHook = null;
+            this.#idling = false;
+            // The session is over: DONE was accepted, or the server gave up on it with
+            // a NO/BAD.  Either way its reader has to hear it now, not when the idle
+            // timer closes the socket.
+            finish();
             drainResolve?.();
           }
           return;
@@ -492,6 +514,7 @@ export class Connection {
         const ev = this.#parseIdleEvent(line);
         if (ev) pushIdleEvent(ev);
       };
+      this.#idling = true;
 
       this.#transport!.send(`${idleTag} IDLE`);
       const continuation = await continuations;
@@ -499,6 +522,7 @@ export class Connection {
         clearTimeout(idleTimer);
         this.#idleHook = null;
         this.#idleEventResolve = null;
+        this.#idling = false;
         throw new Error(`Expected continuation, got: ${continuation}`);
       }
     };
