@@ -14,6 +14,72 @@ function debugSocket(socket: Socket, onWrite: (raw: string) => void): Socket {
   return socket;
 }
 
+// ── items ─────────────────────────────────────────────────────────────────
+
+/**
+ * One thing the transport took off the wire, or the connection ending.
+ *
+ * The callbacks below are the older view of the same framing; a session loop
+ * reads this stream instead, because a command's reply and the connection
+ * going are both steps a loop takes, not notifications it is handed.
+ */
+export type TransportItem =
+  | { kind: 'line'; line: string }
+  | { kind: 'continue'; line: string }
+  | { kind: 'literal'; data: string }
+  | { kind: 'ended'; error?: Error };
+
+/**
+ * The item stream: pushed by the framing code, pulled by one reader.
+ *
+ * `ended` is delivered as the last item, so a `for await` reader sees the
+ * connection go rather than falling out of the loop without knowing why; the
+ * call after it reports the iteration finished.  Items that arrive before a
+ * reader starts are held in order — a stream nobody reads is a buffer, not a
+ * loss, and there is one reader by construction.
+ */
+export class TransportItems implements AsyncIterable<TransportItem> {
+  #queue: TransportItem[] = [];
+  #wake: (() => void) | null = null;
+  #ended = false;
+  #finished = false;
+
+  push(item: TransportItem): void {
+    if (this.#ended) return;
+    this.#queue.push(item);
+    this.#wakeNow();
+  }
+
+  end(error?: Error): void {
+    if (this.#ended) return;
+    this.#ended = true;
+    this.#queue.push({ kind: 'ended', error });
+    this.#wakeNow();
+  }
+
+  async next(): Promise<IteratorResult<TransportItem>> {
+    while (this.#queue.length === 0) {
+      if (this.#finished) return { done: true, value: undefined };
+      await new Promise<void>((resolve) => {
+        this.#wake = resolve;
+      });
+    }
+    const item = this.#queue.shift()!;
+    if (item.kind === 'ended') this.#finished = true;
+    return { done: false, value: item };
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<TransportItem> {
+    return { next: () => this.next() };
+  }
+
+  #wakeNow(): void {
+    const wake = this.#wake;
+    this.#wake = null;
+    wake?.();
+  }
+}
+
 // ── Transport ─────────────────────────────────────────────────────────────
 
 /**
@@ -36,6 +102,7 @@ export class Transport {
   #closeCallback: (() => void) | null = null;
   #errorCallback: ((err: Error) => void) | null = null;
   #onRawRead: ((raw: string) => void) | null = null;
+  #items: TransportItems | null = null;
 
   #debugEnabled: boolean;
   #dead = false;
@@ -98,6 +165,15 @@ export class Transport {
     this.#onRawRead = cb;
   }
 
+  /**
+   * The same framing the callbacks receive, as a stream.  Created by the
+   * first call; one reader, and it starts wherever it starts.
+   */
+  items(): AsyncIterable<TransportItem> {
+    this.#items ??= new TransportItems();
+    return this.#items;
+  }
+
   // ── outbound ──────────────────────────────────────────────────────────
 
   /**
@@ -134,6 +210,22 @@ export class Transport {
   }
 
   // ── line / literal framing (moved from old ImapReader) ────────────────
+  // The framing pushes each item beside the callbacks, so both views see the
+  // same lines while the loop is built next to them.
+  #emitLine(line: string): void {
+    this.#lineCallback?.(line);
+    this.#items?.push({ kind: 'line', line });
+  }
+
+  #emitContinue(line: string): void {
+    this.#continueCallback?.(line);
+    this.#items?.push({ kind: 'continue', line });
+  }
+
+  #emitLiteral(data: string): void {
+    this.#literalCallback?.(data);
+    this.#items?.push({ kind: 'literal', data });
+  }
 
   #onData(raw: string): void {
     this.#buf += raw;
@@ -152,7 +244,7 @@ export class Transport {
         if (this.#literalRemaining === 0) {
           const data = this.#literalChunks.join('');
           this.#literalChunks = [];
-          this.#literalCallback?.(data);
+          this.#emitLiteral(data);
           if (this.#buf.startsWith(CRLF)) {
             this.#buf = this.#buf.slice(2);
           }
@@ -170,18 +262,18 @@ export class Transport {
       if (!line) continue;
 
       if (line.startsWith('+')) {
-        this.#continueCallback?.(line);
+        this.#emitContinue(line);
         continue;
       }
 
       const litMatch = line.match(/\{(\d+)\}$/);
       if (litMatch) {
-        this.#lineCallback?.(line);
+        this.#emitLine(line);
         this.#expectLiteral(Number(litMatch[1]));
         continue;
       }
 
-      this.#lineCallback?.(line);
+      this.#emitLine(line);
     }
   }
 
@@ -196,6 +288,7 @@ export class Transport {
     this.#dead = true;
     this.#debugLog('socket', 'closed');
     this.#closeCallback?.();
+    this.#items?.end();
   }
 
   #onSocketError(e: Error): void {
@@ -203,5 +296,6 @@ export class Transport {
     this.#dead = true;
     this.#debugLog('socket', `error: ${e.message}`);
     this.#errorCallback?.(e);
+    this.#items?.end(e);
   }
 }
