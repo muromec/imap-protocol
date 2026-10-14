@@ -6,7 +6,7 @@
 // connection going), so each case states its own wire bytes rather than
 // leaning on the mock's command machine for them.
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { Socket } from 'node:net';
 
 import { Transport, TransportItems, type TransportItem } from '../src/transport.ts';
@@ -148,5 +148,52 @@ describe('Transport items', () => {
     const rest: TransportItem[] = [];
     for await (const item of stream) rest.push(item);
     expect(rest).toEqual([]);
+  });
+});
+
+// ── debug logging, switched at runtime ──────────────────────────────────────
+//
+// The outgoing side is a wrapper around `socket.write`, so a caller who turns
+// logging on after the connection is up would see the server's answers and never
+// what was sent — the half that usually matters.
+
+describe('debug logging switched at runtime', () => {
+  /** Every console.error call the transport made, as one line each. */
+  async function logged(act: (transport: Transport) => void): Promise<string[]> {
+    const { transport } = await connectTransport();
+    const written: unknown[][] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      written.push(args);
+    });
+    try {
+      act(transport);
+    } finally {
+      spy.mockRestore();
+    }
+    return written.map((args) => args.map((a) => String(a)).join(' '));
+  }
+
+  it('logs what it sends once it is switched on', async () => {
+    const lines = await logged((transport) => {
+      transport.setDebug(true);
+      transport.send('A001 NOOP');
+    });
+    expect(lines.some((line) => line.includes('→') && line.includes('A001 NOOP'))).toBe(true);
+  });
+
+  it('says nothing while it is off, and stops when it is switched back off', async () => {
+    const off = await logged((transport) => {
+      transport.send('A001 NOOP');
+    });
+    expect(off).toEqual([]);
+
+    const afterOff = await logged((transport) => {
+      transport.setDebug(true);
+      transport.send('A002 NOOP');
+      transport.setDebug(false);
+      transport.send('A003 NOOP');
+    });
+    expect(afterOff.some((line) => line.includes('A002'))).toBe(true);
+    expect(afterOff.some((line) => line.includes('A003'))).toBe(false);
   });
 });

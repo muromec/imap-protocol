@@ -100,6 +100,7 @@ export class Transport {
 
   #debugEnabled: boolean;
   #dead = false;
+  #writeHooked = false;
 
   // ── construction ──────────────────────────────────────────────────────
 
@@ -112,10 +113,8 @@ export class Transport {
    */
   constructor(socket: Socket, debugEnabled = false) {
     this.#debugEnabled = debugEnabled;
-    if (debugEnabled) {
-      debugSocket(socket, (raw) => this.#debugLog('→', raw));
-    }
     this.#socket = socket;
+    if (debugEnabled) this.#hookWrites();
 
     socket.on('data', (chunk: Buffer) => {
       const raw = chunk.toString('utf8');
@@ -163,8 +162,23 @@ export class Transport {
 
   // ── debug ─────────────────────────────────────────────────────────────
 
+  /**
+   * Turn protocol logging on or off.
+   *
+   * The outgoing side is a wrapper around `socket.write`, so switching it on after
+   * the connection was made has to install it now: otherwise a caller who turns
+   * logging on at runtime sees the server's answers and never the commands.
+   */
   setDebug(enabled: boolean): void {
     this.#debugEnabled = enabled;
+    if (enabled) this.#hookWrites();
+  }
+
+  /** Install the outgoing-side logging, once. */
+  #hookWrites(): void {
+    if (this.#writeHooked) return;
+    this.#writeHooked = true;
+    debugSocket(this.#socket, (raw) => this.#debugLog('→', raw));
   }
 
   #debugLog(kind: string, raw: string): void {
