@@ -2,14 +2,14 @@ import tls from 'node:tls';
 import { Socket } from 'node:net';
 import type { ImapConfig } from './interface.ts';
 import { Transport } from './transport.ts';
-import { CommandDispatcher } from './dispatch.ts';
+import { Session } from './session.ts';
 
 // ── public API ─────────────────────────────────────────────────────────────
 
 /**
  * Establish an IMAP connection: create socket, negotiate TLS/STARTTLS,
  * authenticate with LOGIN, and fetch CAPABILITY.  Returns a fully
- * authenticated Transport + CommandDispatcher pair ready for IMAP
+ * authenticated Transport + Session pair ready for IMAP
  * operations.
  *
  * Timeouts are sourced from `config` (connTimeout, authTimeout,
@@ -18,26 +18,26 @@ import { CommandDispatcher } from './dispatch.ts';
 export async function connect(
   config: ImapConfig,
   debugEnabled: boolean,
-): Promise<{ transport: Transport; dispatcher: CommandDispatcher; capabilities: Set<string> }> {
+): Promise<{ transport: Transport; session: Session; capabilities: Set<string> }> {
   const socket = await createSocket(config);
   let transport = new Transport(socket, debugEnabled);
-  let dispatcher = new CommandDispatcher(transport, config.commandTimeout ?? 30_000);
+  let session = new Session(transport, { commandTimeout: config.commandTimeout ?? 30_000 });
 
-  const greeting = await waitForGreeting(dispatcher, config);
+  const greeting = await waitForGreeting(session, config);
 
   if (greeting.starttls) {
-    const result = await starttls(dispatcher, socket, transport, debugEnabled, config);
+    const result = await starttls(session, socket, transport, debugEnabled, config);
     transport = result.transport;
-    dispatcher = result.dispatcher;
+    session = result.session;
   }
 
   const capabilities = new Set<string>();
   if (!greeting.preauth) {
-    await login(dispatcher, config);
+    await login(session, config);
   }
-  await fetchCapabilities(dispatcher, capabilities);
+  await fetchCapabilities(session, capabilities);
 
-  return { transport, dispatcher, capabilities };
+  return { transport, session, capabilities };
 }
 
 // ── socket creation ────────────────────────────────────────────────────────
@@ -82,13 +82,13 @@ async function createSocket(config: ImapConfig): Promise<Socket> {
 // ── greeting detection ─────────────────────────────────────────────────────
 
 async function waitForGreeting(
-  dispatcher: CommandDispatcher,
+  session: Session,
   config: ImapConfig,
 ): Promise<{ starttls: boolean; preauth: boolean }> {
   const tlsEnabled = config.tls !== false;
 
   return new Promise((resolve, reject) => {
-    dispatcher.onUntagged((line) => {
+    session.onUntagged((line) => {
       if (!line.startsWith('* OK') && !line.startsWith('* PREAUTH')) return;
 
       // Check for STARTTLS in greeting capabilities.
@@ -122,13 +122,13 @@ async function waitForGreeting(
 // ── STARTTLS upgrade ────────────────────────────────────────────────────────
 
 async function starttls(
-  dispatcher: CommandDispatcher,
+  session: Session,
   rawSocket: Socket,
   _oldTransport: Transport,
   debugEnabled: boolean,
   config: ImapConfig,
-): Promise<{ transport: Transport; dispatcher: CommandDispatcher }> {
-  await dispatcher.sendCommand('STARTTLS');
+): Promise<{ transport: Transport; session: Session }> {
+  await session.sendCommand('STARTTLS');
 
   const tlsSocket = tls.connect({
     socket: rawSocket,
@@ -137,14 +137,14 @@ async function starttls(
   });
 
   const newTransport = new Transport(tlsSocket, debugEnabled);
-  const newDispatcher = new CommandDispatcher(newTransport, config.commandTimeout ?? 30_000);
+  const newSession = new Session(newTransport, { commandTimeout: config.commandTimeout ?? 30_000 });
 
-  return { transport: newTransport, dispatcher: newDispatcher };
+  return { transport: newTransport, session: newSession };
 }
 
 // ── authentication ─────────────────────────────────────────────────────────
 
-async function login(dispatcher: CommandDispatcher, config: ImapConfig): Promise<void> {
+async function login(session: Session, config: ImapConfig): Promise<void> {
   const authTimeout = config.authTimeout ?? 10_000;
 
   await new Promise<void>((resolve, reject) => {
@@ -152,7 +152,7 @@ async function login(dispatcher: CommandDispatcher, config: ImapConfig): Promise
       reject(new Error('Authentication timed out'));
     }, authTimeout);
 
-    dispatcher
+    session
       .sendCommand(`LOGIN "${config.user}" "${config.password}"`)
       .then(() => {
         clearTimeout(timer);
@@ -168,11 +168,11 @@ async function login(dispatcher: CommandDispatcher, config: ImapConfig): Promise
 // ── capability detection ───────────────────────────────────────────────────
 
 async function fetchCapabilities(
-  dispatcher: CommandDispatcher,
+  session: Session,
   capabilities: Set<string>,
 ): Promise<void> {
   try {
-    const lines = await dispatcher.sendCommand('CAPABILITY');
+    const lines = await session.sendCommand('CAPABILITY');
     for (const line of lines) {
       const m = line.match(/^\* CAPABILITY (.*)/i);
       if (m) {

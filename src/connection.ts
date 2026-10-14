@@ -1,6 +1,7 @@
 import { Transport } from './transport.ts';
-import { CommandDispatcher } from './dispatch.ts';
+import { Session } from './session.ts';
 import { connect } from './connect.ts';
+import { FetchCollector } from './collectors.ts';
 import {
   type ImapConfig,
   type MailboxInfo,
@@ -10,69 +11,42 @@ import {
 
 // ── IMAP protocol constants ────────────────────────────────────────────────
 
-const RE_TAGGED = /^(A\d+) (OK|NO|BAD) /;
 const RE_EXISTS = /^\* (\d+) EXISTS/;
 const RE_RECENT = /^\* (\d+) RECENT/;
 const RE_FLAGS = /^\* FLAGS \((.*)\)/;
 const RE_SEARCH = /^\* SEARCH (.*)/;
 const RE_FETCH_START = /^\* (\d+) FETCH \((.*)/;
 
-// ── line-oriented buffered reader ──────────────────────────────────────────
-
-/**
- * Wraps a socket and yields complete IMAP lines / literals.
- *
- * Normal lines end with CRLF.  When a line contains a literal marker
- * `{<size>}` at the end, the reader switches to "literal mode" and
- * accumulates exactly `<size>` bytes before resuming line mode.
- *
- * Lines starting with `+` are IMAP continuations and are routed to
- * `onContinue` rather than `onLine`.
- */
 // ── connection ──────────────────────────────────────────────────────────────
 
+/**
+ * One IMAP connection: the operations that are spelled in IMAP, on top of a
+ * Session that owns the wire.
+ *
+ * Tags, batches, timeouts and the IDLE state belong to the session.  What is
+ * here is what the words mean: a mailbox is SELECT plus the lines that come
+ * with it, a fetch is `UID FETCH ... BODY.PEEK[...]` read by a collector, and
+ * a flag change is a STORE.
+ */
 export class Connection {
   #config: ImapConfig;
   #transport: Transport | null = null;
-  #dispatcher: CommandDispatcher | null = null;
+  #session: Session | null = null;
   #debugEnabled: boolean;
 
   constructor(config: ImapConfig) {
     this.#config = config;
     this.#debugEnabled = config.debug ?? false;
   }
+
   #mailboxInfo: MailboxInfo | null = null;
 
   /** Server capabilities discovered after LOGIN. */
   capabilities = new Set<string>();
 
-  // fetch state
-  #fetchResolve: ((msgs: FetchedMessage[]) => void) | null = null;
-  #fetchResults: FetchedMessage[] = [];
-  #fetchPending = 0;
-
-  // continuation callback for IDLE/APPEND (+ lines)
-  #continuationResolve: ((line: string) => void) | null = null;
-
-  // idle event hook — called from dispatcher for every untagged line
-  // during an active IDLE session.  Null when not idling.
-  #idleHook: ((line: string) => void) | null = null;
-
-  // idle event resolver — set during idle() to break the loop on socket close.
-  #idleEventResolve: ((ev: IdleEvent | null) => void) | null = null;
-
-  // drain resolver — set during idle() DONE phase; resolved on socket close
-  // so the finally block doesn't hang if the socket dies mid-drain.
-  #idleDrainResolve: (() => void) | null = null;
-
-  // Whether an IDLE session is in flight.  While one is, the only line a client may
-  // send is DONE — anything else and the server ends the session over it, leaving the
-  // command unanswered (see sendCommand).
-  #idling = false;
-
   /** Whether the connection has been closed or has errored out. */
   get dead(): boolean {
-    return this.#dispatcher?.dead ?? true;
+    return this.#session?.dead ?? true;
   }
 
   /**
@@ -92,33 +66,6 @@ export class Connection {
     }
   }
 
-  #wireCallbacks(): void {
-    this.#transport!.onLiteral((data) => this.#onLiteral(data));
-    this.#transport!.onContinue((line) => this.#onContinue(line));
-    this.#transport!.onRawRead((raw) => {
-      if (this.#debugEnabled) this.#debug('←', JSON.stringify(raw));
-    });
-    this.#dispatcher!.onUntagged((line) => this.#sessionUntagged(line));
-    this.#dispatcher!.onDead(() => {
-      if (this.#idleEventResolve) {
-        this.#idleEventResolve(null);
-        this.#idleEventResolve = null;
-      }
-      if (this.#idleDrainResolve) {
-        this.#idleDrainResolve();
-        this.#idleDrainResolve = null;
-      }
-      this.#idleHook = null;
-      this.#idling = false;
-      if (this.#fetchResolve) {
-        const r = this.#fetchResolve;
-        this.#fetchResolve = null;
-        this.#fetchQueue = null;
-        r(this.#fetchResults);
-      }
-    });
-  }
-
   /**
    * Check whether the server advertises a given capability.
    * Capability names are compared case-insensitively.
@@ -127,44 +74,25 @@ export class Connection {
     return this.capabilities.has(cap.toUpperCase());
   }
 
-  // ── protocol helpers (delegate to dispatcher) ─────────────────────────
+  // ── protocol helpers (delegate to the session) ─────────────────────────
 
   sendCommand(cmd: string): Promise<string[]> {
-    if (this.#idling) {
-      return Promise.reject(
-        new Error('this connection is in an IDLE session; finish it before another command'),
-      );
-    }
-    return this.#dispatcher!.sendCommand(cmd);
+    return this.#live().sendCommand(cmd);
   }
 
-  sendCommandWithContinuation(cmd: string): Promise<string> {
-    return new Promise((resolve) => {
-      this.#continuationResolve = resolve;
-      this.#transport!.send(cmd);
-    });
-  }
-
-  // ── session-level untagged handler ────────────────────────────────────
-
-  #sessionUntagged(line: string): void {
-    this.#debug('line', line);
-
-    // Idle hook consumes all lines (tagged and untagged) when active.
-    if (this.#idleHook) this.#idleHook(line);
-
-    this.#handleUntagged(line);
-    this.#handleFetchLine(line);
+  #live(): Session {
+    if (!this.#session) throw new Error('Connection is dead');
+    return this.#session;
   }
 
   // ── connect / close ────────────────────────────────────────────────────
 
   async connect(): Promise<void> {
-    const { transport, dispatcher, capabilities } = await connect(this.#config, this.#debugEnabled);
+    const { transport, session, capabilities } = await connect(this.#config, this.#debugEnabled);
     this.#transport = transport;
-    this.#dispatcher = dispatcher;
+    this.#session = session;
     this.capabilities = capabilities;
-    this.#wireCallbacks();
+    session.onUntagged((line) => this.#sessionUntagged(line));
   }
 
   async close(): Promise<void> {
@@ -174,21 +102,17 @@ export class Connection {
     } catch {
       // LOGOUT may fail; close the socket regardless.
     } finally {
-      this.#transport?.close();
+      this.#session?.close();
       this.#transport = null;
-      this.#dispatcher = null;
+      this.#session = null;
     }
   }
 
-  // ── continuation dispatch ──────────────────────────────────────────────
+  // ── session-level untagged handler ────────────────────────────────────
 
-  #onContinue(line: string): void {
-    this.#debug('cont', line);
-    if (this.#continuationResolve) {
-      const r = this.#continuationResolve;
-      this.#continuationResolve = null;
-      r(line);
-    }
+  #sessionUntagged(line: string): void {
+    this.#debug('line', line);
+    this.#handleUntagged(line);
   }
 
   // ── untagged status updates ────────────────────────────────────────────
@@ -205,86 +129,6 @@ export class Connection {
 
     const flags = line.match(RE_FLAGS);
     if (flags) info.flags = flags[1].split(' ').filter(Boolean);
-  }
-
-  // ── fetch response parsing ─────────────────────────────────────────────
-
-  #handleFetchLine(line: string): void {
-    // Ignore unsolicited FETCH responses (e.g. during IDLE) when no
-    // explicit fetch is in progress.  Otherwise they leak into
-    // #fetchQueue and #fetchResults.
-    if (!this.#fetchResolve) return;
-
-    const start = line.match(RE_FETCH_START);
-    if (!start) return;
-
-    const seqno = Number(start[1]);
-    const rest = start[2];
-
-    const uidMatch = rest.match(/UID (\d+)/);
-    const flagsMatch = rest.match(/FLAGS \(([^)]*)\)/);
-    const uid = uidMatch ? Number(uidMatch[1]) : 0;
-    const flags = flagsMatch ? flagsMatch[1].split(' ').filter(Boolean) : [];
-
-    // body literal: BODY[...] {size}
-    const litMatch = rest.match(/BODY\[[^\]]*\] \{(\d+)\}/);
-    if (litMatch) {
-      this.#fetchPending++;
-      // data will arrive via #onLiteral
-      // stash seqno/uid/flags for when literal completes
-      const ctx = { seqno, uid, flags };
-      // We need to match the next literal to this fetch entry.
-      // Since IMAP sends fetch responses sequentially, we push to a queue.
-      if (!this.#fetchQueue) this.#fetchQueue = [];
-      this.#fetchQueue.push(ctx);
-    } else {
-      // inline body
-      const bodyMatch = rest.match(/BODY\[[^\]]*\] (.+)/);
-      const body = bodyMatch ? bodyMatch[1] : '';
-      this.#fetchResults.push({ uid, seqno, body, flags });
-    }
-
-    // check for end of fetch: all results in, no pending literals
-    this.#maybeFinishFetch();
-  }
-
-  #fetchQueue: Array<{ seqno: number; uid: number; flags: string[] }> | null = null;
-
-  #onLiteral(data: string): void {
-    const ctx = this.#fetchQueue?.shift();
-    if (ctx) {
-      this.#fetchResults.push({
-        uid: ctx.uid,
-        seqno: ctx.seqno,
-        body: data,
-        flags: ctx.flags,
-      });
-      this.#fetchPending--;
-      this.#maybeFinishFetch();
-    }
-  }
-
-  #maybeFinishFetch(): void {
-    if (
-      this.#fetchResolve &&
-      this.#fetchPending === 0 &&
-      (!this.#fetchQueue || this.#fetchQueue.length === 0)
-    ) {
-      // All results collected. But we need to be careful: the tagged OK
-      // may not have arrived yet. We rely on the fact that untagged fetch
-      // responses always precede the tagged OK.  However, if we're in the
-      // middle of processing an untagged line, the tagged OK hasn't been
-      // dispatched yet. So we defer to the next tick to let the tagged
-      // response flush through.
-      setImmediate(() => {
-        const r = this.#fetchResolve;
-        if (r) {
-          this.#fetchResolve = null;
-          this.#fetchQueue = null;
-          r(this.#fetchResults);
-        }
-      });
-    }
   }
 
   // ── mailbox ─────────────────────────────────────────────────────────────
@@ -356,29 +200,15 @@ export class Connection {
 
   fetch(uids: number[], options?: { bodies?: string | string[] }): Promise<FetchedMessage[]> {
     if (uids.length === 0) return Promise.resolve([]);
-    if (this.#fetchResolve) {
-      throw new Error('A fetch is already in progress; await it before starting another.');
-    }
 
     const bodies = options?.bodies ?? '';
     const bodyParts = Array.isArray(bodies) ? bodies : [bodies];
     const bodySpec = bodyParts.map((b) => `BODY.PEEK[${b}]`).join(' ');
 
-    this.#fetchResults = [];
-    this.#fetchPending = 0;
-    this.#fetchQueue = [];
-
-    return new Promise((resolve) => {
-      this.#fetchResolve = resolve;
-      const uidStr = uids.join(',');
-      this.sendCommand(`UID FETCH ${uidStr} (UID FLAGS ${bodySpec})`);
-      // the tagged OK ends up resolving the pending promise too,
-      // but we get our results via untagged fetch lines + literals.
-      // Make sure the tagged response doesn't interfere:
-      // #dispatchLine will call pending.resolve for the tag, which is
-      // a no-op for our caller (nobody awaits sendCommand here).
-      // We resolve via #maybeFinishFetch.
-    });
+    return this.#live().send(
+      `UID FETCH ${uids.join(',')} (UID FLAGS ${bodySpec})`,
+      new FetchCollector(),
+    );
   }
 
   // ── flags ───────────────────────────────────────────────────────────────
@@ -403,15 +233,13 @@ export class Connection {
   /**
    * Enter IDLE mode and yield real-time mailbox events.
    *
-   * The caller iterates with `for await (const event of conn.idle())`.  Breaking out
-   * of the loop — or calling `.return()` on the iterator — sends DONE, waits for the
-   * session's tagged OK, and leaves the connection usable.
+   * The caller iterates with `for await (const event of conn.idle())`.  Breaking
+   * out of the loop — or calling `.return()` on the iterator — ends the session
+   * (DONE, its tagged reply) and leaves the connection usable.
    *
-   * The iterator is written by hand rather than as a generator on purpose.  A
-   * generator parked on its event wait cannot be interrupted: `return()` is queued
-   * behind that await, which settles only when the server says something, and a
-   * keepalive break is made exactly when it does not.  The DONE would then never be
-   * sent, and the server would break the session off instead.
+   * The session belongs to the loop underneath, so a command asked for while
+   * this iteration is open does not have to wait for it: the session is broken
+   * for that batch and opened again afterwards.
    *
    * Throws if the server does not advertise the IDLE capability.
    */
@@ -420,141 +248,26 @@ export class Connection {
       throw new Error('Server does not support IDLE');
     }
 
-    // Tag for this IDLE session.  We do NOT register it in the dispatcher's pending
-    // map — that would cause the dispatcher to consume the tagged OK instead of
-    // forwarding it to the idle hook.
-    const idleTag = this.#dispatcher!.nextTag();
-    this.#idleTag = idleTag;
-
-    let started = false;
-    let ended = false;
-    let ending: Promise<void> | null = null;
-    let eventResolve: ((ev: IdleEvent | null) => void) | null = null;
-    let drainResolve: (() => void) | null = null;
-    const pending: IdleEvent[] = [];
-
-    const pushIdleEvent = (ev: IdleEvent): void => {
-      const resolve = eventResolve;
-      eventResolve = null;
-      if (resolve !== null && !ended) resolve(ev);
-      else pending.push(ev);
-    };
-
-    const continuations = new Promise<string>((resolve) => {
-      this.#continuationResolve = resolve;
-    });
-
-    /** Let a waiting reader finish: the session is over, whatever ended it. */
-    const finish = (): void => {
-      ended = true;
-
-      const waiting = eventResolve;
-      eventResolve = null;
-      waiting?.(null);
-    };
-
-    /**
-     * Send DONE once, wait for the tagged OK, and let a waiting reader finish.
-     *
-     * Idempotent, because a caller that breaks out of the loop and a socket that goes
-     * away both ask for the same ending.
-     */
-    const end = (): Promise<void> => {
-      if (ending !== null) return ending;
-      this.#idling = false;
-      finish();
-
-      ending = (async () => {
-        // A socket that is already gone takes no DONE and answers none.
-        if (this.#idleHook != null && this.#transport != null) {
-          try {
-            this.#transport.send('DONE');
-            await new Promise<void>((resolve) => {
-              drainResolve = resolve;
-              this.#idleDrainResolve = resolve;
-            });
-          } catch (err) {
-            this.#debug('idle', 'DONE/drain failed', err);
-          }
-        }
-        this.#idleHook = null;
-        this.#idleEventResolve = null;
-        this.#idleDrainResolve = null;
-      })();
-      return ending;
-    };
-
-    const start = async (): Promise<void> => {
-      started = true;
-
-      // While IDLE is open the server may say nothing at all, so this is the only
-      // thing that ends a session its caller forgot about.
-      const idleTimer = setTimeout(() => {
-        this.#transport?.close();
-      }, this.#config.commandTimeout ?? 30_000);
-
-      // Install the idle hook BEFORE sending the command so we catch events that
-      // arrive synchronously with the server response.
-      this.#idleHook = (line: string) => {
-        this.#debug('idle', line);
-        const tagged = line.match(RE_TAGGED);
-        if (tagged) {
-          if (tagged[1] === idleTag) {
-            clearTimeout(idleTimer);
-            this.#idleHook = null;
-            this.#idling = false;
-            // The session is over: DONE was accepted, or the server gave up on it with
-            // a NO/BAD.  Either way its reader has to hear it now, not when the idle
-            // timer closes the socket.
-            finish();
-            drainResolve?.();
-          }
-          return;
-        }
-        const ev = this.#parseIdleEvent(line);
-        if (ev) pushIdleEvent(ev);
-      };
-      this.#idling = true;
-
-      this.#transport!.send(`${idleTag} IDLE`);
-      const continuation = await continuations;
-      if (!continuation.startsWith('+')) {
-        clearTimeout(idleTimer);
-        this.#idleHook = null;
-        this.#idleEventResolve = null;
-        this.#idling = false;
-        throw new Error(`Expected continuation, got: ${continuation}`);
-      }
-    };
+    const lines = this.#live().idle()[Symbol.asyncIterator]();
 
     const iterator: AsyncIterator<IdleEvent> = {
       next: async (): Promise<IteratorResult<IdleEvent>> => {
-        if (!started) await start();
-
-        const queued = pending.shift();
-        if (queued !== undefined) return { done: false, value: queued };
-        if (ended) return { done: true, value: undefined };
-
-        const event = await new Promise<IdleEvent | null>((resolve) => {
-          eventResolve = resolve;
-          this.#idleEventResolve = resolve;
-        });
-        // null: the session is over — the caller asked for it, or the socket went.
-        if (event == null) return { done: true, value: undefined };
-        return { done: false, value: event };
+        for (;;) {
+          const result = await lines.next();
+          if (result.done) return { done: true, value: undefined };
+          const event = this.#parseIdleEvent(result.value);
+          if (event) return { done: false, value: event };
+        }
       },
 
       return: async (): Promise<IteratorResult<IdleEvent>> => {
-        await end();
+        await lines.return?.();
         return { done: true, value: undefined };
       },
     };
 
     return { [Symbol.asyncIterator]: () => iterator };
   }
-
-  // Tag of the current IDLE command, set when idle() is called.
-  #idleTag: string = '';
 
   /**
    * Parse an untagged IMAP line into an IdleEvent, or null if the line

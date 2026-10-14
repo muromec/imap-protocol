@@ -657,54 +657,28 @@ describe('socket error propagation', () => {
   });
 });
 
-// ── Batch 3a: fetch concurrency guard ────────────────────────────────────
+// ── fetches asked for together ───────────────────────────────────────────
 
 describe('fetch concurrency', () => {
-  it('throws when fetch is called while another fetch is in flight', async () => {
+  it('answers two fetches asked for at once without mixing their results', async () => {
     const server = await newServer();
     const conn = await connectAndLogin(server, [
       {
         expect: /^A\d+ UID FETCH 1 \(UID FLAGS BODY\.PEEK\[\]\)$/,
-        // never respond — fetch stays in-flight
-        respond: '',
+        respond: ['* 1 FETCH (UID 1 FLAGS () BODY[] {3}', 'one'],
+      },
+      {
+        expect: /^A\d+ UID FETCH 2 \(UID FLAGS BODY\.PEEK\[\]\)$/,
+        respond: ['* 2 FETCH (UID 2 FLAGS () BODY[] {3}', 'two'],
       },
     ]);
 
-    // Start first fetch (it won't complete because the mock sends an
-    // empty respond which auto-tags OK — but that's enough to mark it
-    // as in-flight briefly).  Use a server that needs an explicit
-    // command before the tagged OK.
-    //
-    // Actually, just call fetch twice synchronously.  The first call
-    // sets #fetchResolve, the second throws.
-    conn.fetch([1]);
-    expect(() => conn.fetch([2])).toThrow('A fetch is already in progress');
+    const [first, second] = await Promise.all([conn.fetch([1]), conn.fetch([2])]);
+
+    expect(first.map((m) => [m.uid, m.body])).toEqual([[1, 'one']]);
+    expect(second.map((m) => [m.uid, m.body])).toEqual([[2, 'two']]);
     await conn.close();
     server.close();
-  });
-});
-
-// ── Batch 3a: continuation handling ─────────────────────────────────────
-
-describe('continuations', () => {
-  it('routes + lines to onContinue callback', async () => {
-    const server = await newServer();
-    // The mock's #dispatchLine doesn't support continuations yet,
-    // so we test this indirectly: sendCommandWithContinuation
-    // sends IDLE, the mock auto-responds with a tagged OK (not a +),
-    // so the continuation promise never resolves.  We just verify
-    // the method exists and doesn't crash.
-    const conn = await connectAndLogin(server, []);
-
-    // sendCommandWithContinuation sends a raw command and returns
-    // a promise for the + continuation.  Use a tagged command so
-    // the mock auto-responds cleanly rather than leaving a dangling
-    // socket that causes ECONNRESET during cleanup.
-    const contPromise = conn.sendCommandWithContinuation('A0003 IDLE');
-    expect(contPromise).toBeInstanceOf(Promise);
-
-    // Clean up: close the connection, which resolves LOGOUT cleanly.
-    await conn.close();
   });
 });
 
@@ -795,10 +769,11 @@ describe('idle', () => {
     server.close();
   });
 
-  it('refuses a command while the session idles, instead of feeding it a BAD', async () => {
-    // A server ends an IDLE session when anything but DONE arrives, and never answers
-    // the offending command (kpnmail: `A0004 BAD Expected DONE`).  Sent anyway it buys
-    // a hung promise and a session killed from under the caller.
+  it('breaks the session for a command instead of feeding the server a BAD', async () => {
+    // A server ends an IDLE session when anything but DONE arrives, and never
+    // answers the offending command (kpnmail: `A0004 BAD Expected DONE`).  So
+    // the command waits its turn: the session is broken with DONE first, and
+    // the command goes out after the server has answered that.
     const server = await newServer();
     const conn = await connectAndLogin(server, [{ expect: /^A\d+ IDLE$/, respond: ['+ idling'] }]);
 
@@ -806,22 +781,15 @@ describe('idle', () => {
     const first = iterator.next();
     await server.idled();
 
-    const outcome = await Promise.race([
-      conn.search(['UNSEEN']).then(
-        () => 'resolved' as const,
-        (err: Error) => `refused: ${err.message}`,
-      ),
-      new Promise<string>((r) => setTimeout(() => r('still running'), 1_500)),
-    ]);
+    expect(await conn.search(['UNSEEN'])).toEqual([]);
 
-    expect(outcome).toMatch(/idle/i);
-    expect(server.received.filter((line) => line.endsWith('SEARCH UNSEEN'))).toEqual([]);
-    expect(server.badDones).toBe(0);
-
-    // The session itself is untouched by the refusal: ending it works as ever.
-    await iterator.return?.();
     expect(server.dones).toBe(1);
+    expect(server.badDones).toBe(0);
+    const searchAt = server.received.findIndex((line) => line.endsWith('SEARCH UNSEEN'));
+    expect(searchAt).toBeGreaterThan(-1);
+    expect(server.received.indexOf('DONE')).toBeLessThan(searchAt);
 
+    await iterator.return?.();
     void first.catch(() => {});
     server.close();
   });
