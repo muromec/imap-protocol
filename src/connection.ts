@@ -93,6 +93,9 @@ export class Connection {
     this.#session = session;
     this.capabilities = capabilities;
     session.onUntagged((line) => this.#sessionUntagged(line));
+    transport.onRawRead((raw) => {
+      if (this.#debugEnabled) this.#debug('←', JSON.stringify(raw));
+    });
   }
 
   async close(): Promise<void> {

@@ -85,8 +85,6 @@ describe('Transport items', () => {
       { expect: /^A1 FETCH /, respond: ['* 1 FETCH (BODY[] {5}', 'hello'] },
       { expect: /^A2 NOOP$/, respond: '+ nothing to say' },
     ]);
-    const lines: string[] = [];
-    transport.onLine((line) => lines.push(line));
     const items = transport.items()[Symbol.asyncIterator]();
 
     expect(await take(items, 1, 'the greeting')).toEqual([
@@ -101,9 +99,6 @@ describe('Transport items', () => {
       { kind: 'line', line: 'A1 OK done' },
       { kind: 'continue', line: '+ nothing to say' },
     ]);
-
-    // the callbacks are the older view of the same framing, and see the same lines
-    expect(lines).toEqual(['* OK mock IMAP server ready', '* 1 FETCH (BODY[] {5}', 'A1 OK done']);
   });
 
   it('reports the connection going as an item, and then finishes', async () => {

@@ -19,9 +19,8 @@ function debugSocket(socket: Socket, onWrite: (raw: string) => void): Socket {
 /**
  * One thing the transport took off the wire, or the connection ending.
  *
- * The callbacks below are the older view of the same framing; a session loop
- * reads this stream instead, because a command's reply and the connection
- * going are both steps a loop takes, not notifications it is handed.
+ * The session loop reads it: a command's reply and the connection going
+ * are steps a loop takes, not notifications it is handed.
  */
 export type TransportItem =
   | { kind: 'line'; line: string }
@@ -96,11 +95,6 @@ export class Transport {
   #literalRemaining = 0;
   #literalChunks: string[] = [];
 
-  #lineCallback: ((line: string) => void) | null = null;
-  #literalCallback: ((data: string) => void) | null = null;
-  #continueCallback: ((line: string) => void) | null = null;
-  #closeCallback: (() => void) | null = null;
-  #errorCallback: ((err: Error) => void) | null = null;
   #onRawRead: ((raw: string) => void) | null = null;
   #items: TransportItems | null = null;
 
@@ -137,37 +131,14 @@ export class Transport {
     });
   }
 
-  // ── public callbacks (single-slot each) ───────────────────────────────
-
-  onLine(cb: (line: string) => void): void {
-    this.#lineCallback = cb;
-  }
-
-  onLiteral(cb: (data: string) => void): void {
-    this.#literalCallback = cb;
-  }
-
-  /** IMAP continuation lines (starting with `+`). */
-  onContinue(cb: (line: string) => void): void {
-    this.#continueCallback = cb;
-  }
-
-  onClose(cb: () => void): void {
-    this.#closeCallback = cb;
-  }
-
-  onError(cb: (err: Error) => void): void {
-    this.#errorCallback = cb;
-  }
-
   /** Raw-read hook for debug logging — one callback, replaceable. */
   onRawRead(cb: ((raw: string) => void) | null): void {
     this.#onRawRead = cb;
   }
 
   /**
-   * The same framing the callbacks receive, as a stream.  Created by the
-   * first call; one reader, and it starts wherever it starts.
+   * The framing the transport takes off the socket, as a stream.  Created
+   * by the first call; the loop reads it, and it starts wherever it starts.
    */
   items(): AsyncIterable<TransportItem> {
     this.#items ??= new TransportItems();
@@ -209,24 +180,7 @@ export class Transport {
     return this.#dead;
   }
 
-  // ── line / literal framing (moved from old ImapReader) ────────────────
-  // The framing pushes each item beside the callbacks, so both views see the
-  // same lines while the loop is built next to them.
-  #emitLine(line: string): void {
-    this.#lineCallback?.(line);
-    this.#items?.push({ kind: 'line', line });
-  }
-
-  #emitContinue(line: string): void {
-    this.#continueCallback?.(line);
-    this.#items?.push({ kind: 'continue', line });
-  }
-
-  #emitLiteral(data: string): void {
-    this.#literalCallback?.(data);
-    this.#items?.push({ kind: 'literal', data });
-  }
-
+  // ── line / literal framing ───────────────────────────────────────────────
   #onData(raw: string): void {
     this.#buf += raw;
     this.#drain();
@@ -244,7 +198,7 @@ export class Transport {
         if (this.#literalRemaining === 0) {
           const data = this.#literalChunks.join('');
           this.#literalChunks = [];
-          this.#emitLiteral(data);
+          this.#items?.push({ kind: 'literal', data });
           if (this.#buf.startsWith(CRLF)) {
             this.#buf = this.#buf.slice(2);
           }
@@ -262,18 +216,18 @@ export class Transport {
       if (!line) continue;
 
       if (line.startsWith('+')) {
-        this.#emitContinue(line);
+        this.#items?.push({ kind: 'continue', line });
         continue;
       }
 
       const litMatch = line.match(/\{(\d+)\}$/);
       if (litMatch) {
-        this.#emitLine(line);
+        this.#items?.push({ kind: 'line', line });
         this.#expectLiteral(Number(litMatch[1]));
         continue;
       }
 
-      this.#emitLine(line);
+      this.#items?.push({ kind: 'line', line });
     }
   }
 
@@ -287,7 +241,6 @@ export class Transport {
   #onSocketClose(): void {
     this.#dead = true;
     this.#debugLog('socket', 'closed');
-    this.#closeCallback?.();
     this.#items?.end();
   }
 
@@ -295,7 +248,6 @@ export class Transport {
     if (this.#dead) return;
     this.#dead = true;
     this.#debugLog('socket', `error: ${e.message}`);
-    this.#errorCallback?.(e);
     this.#items?.end(e);
   }
 }
