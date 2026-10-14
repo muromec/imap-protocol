@@ -795,6 +795,72 @@ describe('idle', () => {
     server.close();
   });
 
+  it('refuses a command while the session idles, instead of feeding it a BAD', async () => {
+    // A server ends an IDLE session when anything but DONE arrives, and never answers
+    // the offending command (kpnmail: `A0004 BAD Expected DONE`).  Sent anyway it buys
+    // a hung promise and a session killed from under the caller.
+    const server = await newServer();
+    const conn = await connectAndLogin(server, [{ expect: /^A\d+ IDLE$/, respond: ['+ idling'] }]);
+
+    const iterator = conn.idle()[Symbol.asyncIterator]();
+    const first = iterator.next();
+    await server.idled();
+
+    const outcome = await Promise.race([
+      conn.search(['UNSEEN']).then(
+        () => 'resolved' as const,
+        (err: Error) => `refused: ${err.message}`,
+      ),
+      new Promise<string>((r) => setTimeout(() => r('still running'), 1_500)),
+    ]);
+
+    expect(outcome).toMatch(/idle/i);
+    expect(server.received.filter((line) => line.endsWith('SEARCH UNSEEN'))).toEqual([]);
+    expect(server.badDones).toBe(0);
+
+    // The session itself is untouched by the refusal: ending it works as ever.
+    await iterator.return?.();
+    expect(server.dones).toBe(1);
+
+    void first.catch(() => {});
+    server.close();
+  });
+
+  it('lets its reader learn when the server ends the session', async () => {
+    // A server that gives up on a session answers the IDLE tag with NO or BAD.  The
+    // reader has to hear it then: left waiting for an event that will never come, its
+    // caller holds an iterator that looks alive until the idle timer closes the socket
+    // half a minute later.
+    const server = await newServer();
+    server.scenario(
+      [
+        { expect: /^A\d+ LOGIN /, respond: (cmd) => `${cmd.match(/^A\d+/)![0]} OK logged in` },
+        { expect: /^A\d+ CAPABILITY$/, respond: '* CAPABILITY IMAP4rev1 UIDPLUS MOVE IDLE' },
+        { expect: /^A\d+ IDLE$/, respond: ['+ idling'] },
+      ],
+      { allowExtra: true, idleLimitMs: 200 },
+    );
+    const conn = new Connection({
+      user: 'test',
+      password: 'secret',
+      host: '127.0.0.1',
+      port: server.port,
+      tls: false,
+    });
+    await conn.connect();
+
+    const iterator = conn.idle()[Symbol.asyncIterator]();
+    const outcome = await Promise.race([
+      iterator.next().then((result) => `next: done=${result.done}` as const),
+      new Promise<string>((r) => setTimeout(() => r('still waiting'), 1_500)),
+    ]);
+
+    expect(outcome).toBe('next: done=true');
+    expect(server.badDones).toBe(1);
+
+    server.close();
+  });
+
   it('yields EXISTS event', async () => {
     const server = await newServer();
     const conn = await connectAndLogin(server, [

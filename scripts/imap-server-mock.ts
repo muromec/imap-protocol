@@ -276,6 +276,17 @@ export class MockImapServer {
       return;
     }
 
+    // Anything but DONE while a session idles ends it, and the offending command is
+    // never answered — measured on kpnmail, 2026-10-14: `+ idling`, then a command,
+    // then `A0004 BAD Expected DONE (2.005 + 2.004 + 2.004 secs).` on the IDLE tag.
+    if (this.#idleTag !== null) {
+      this.#sendRaw(`${this.#idleTag} BAD Expected DONE${CRLF}`);
+      this.#idleTag = null;
+      this.badDones++;
+      this.#noteOutcome('bad');
+      return;
+    }
+
     // A watcher-style run: every IDLE is accepted, every other command is answered,
     // and a session ends only when DONE arrives — or when the limit above gives up on
     // it.  CAPABILITY still carries the untagged line the client reads.
