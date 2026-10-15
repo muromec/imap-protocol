@@ -82,10 +82,10 @@ For this pattern we only need:
   metadata from `* N FETCH (...)`, extract EXISTS/RECENT/UIDVALIDITY/etc.
   from SELECT responses.
 
-`ImapReader` does exactly this in ~80 lines.  It maintains a single buffer,
-looks for `\r\n` delimiters, and switches between line mode and literal mode
-as dictated by `{size}` markers.  No parser generator, no recursive descent,
-no intermediate AST.
+This is what the transport does: one buffer, `\r\n` looked for as octets, and
+line and literal modes switched by `{size}` markers.  No parser generator, no
+recursive descent, no intermediate AST.  The buffer is bytes because `{size}`
+counts octets: text is decoded from a complete line, never from a chunk.
 
 ## UID-only operations
 

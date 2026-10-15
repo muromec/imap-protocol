@@ -7,6 +7,9 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { Connection } from '../src/connection.ts';
 import { MockImapServer, type ScenarioStep } from '../scripts/imap-server-mock.ts';
 
+/** A fetched body is the octets the server sent; the test reads them as text. */
+const bytes = (data: Uint8Array): string => Buffer.from(data).toString('utf8');
+
 // ── server factory ─────────────────────────────────────────────────────────
 
 const cleanup: MockImapServer[] = [];
@@ -329,7 +332,7 @@ describe('fetch', () => {
     expect(msgs).toHaveLength(1);
     expect(msgs[0].uid).toBe(42);
     expect(msgs[0].seqno).toBe(1);
-    expect(msgs[0].body).toBe('Hello, world!');
+    expect(bytes(msgs[0].body)).toBe('Hello, world!');
     expect(msgs[0].flags).toEqual(['\\Seen']);
   });
 
@@ -350,9 +353,9 @@ describe('fetch', () => {
     const msgs = await conn.fetch([10, 20]);
     expect(msgs).toHaveLength(2);
     expect(msgs[0].uid).toBe(10);
-    expect(msgs[0].body).toBe('msg10');
+    expect(bytes(msgs[0].body)).toBe('msg10');
     expect(msgs[1].uid).toBe(20);
-    expect(msgs[1].body).toBe('msg20');
+    expect(bytes(msgs[1].body)).toBe('msg20');
   });
 
   it('returns empty array for empty UID list', async () => {
@@ -378,7 +381,7 @@ describe('fetch', () => {
 
     const msgs = await conn.fetch([1], { bodies: 'HEADER' });
     expect(msgs).toHaveLength(1);
-    expect(msgs[0].body).toBe('Subject: Test\r\n');
+    expect(bytes(msgs[0].body)).toBe('Subject: Test\r\n');
   });
 
   // TODO: multi-body-part fetch responses (BODY[HEADER] ... BODY[TEXT] on
@@ -477,9 +480,9 @@ describe('fetchUnseen', () => {
     const msgs = await conn.fetchUnseen();
     expect(msgs).toHaveLength(2);
     expect(msgs[0].uid).toBe(5);
-    expect(msgs[0].body).toBe('a');
+    expect(bytes(msgs[0].body)).toBe('a');
     expect(msgs[1].uid).toBe(6);
-    expect(msgs[1].body).toBe('b');
+    expect(bytes(msgs[1].body)).toBe('b');
   });
 
   it('returns empty array when no unseen messages', async () => {
@@ -675,8 +678,8 @@ describe('fetch concurrency', () => {
 
     const [first, second] = await Promise.all([conn.fetch([1]), conn.fetch([2])]);
 
-    expect(first.map((m) => [m.uid, m.body])).toEqual([[1, 'one']]);
-    expect(second.map((m) => [m.uid, m.body])).toEqual([[2, 'two']]);
+    expect(first.map((m) => [m.uid, bytes(m.body)])).toEqual([[1, 'one']]);
+    expect(second.map((m) => [m.uid, bytes(m.body)])).toEqual([[2, 'two']]);
     await conn.close();
     server.close();
   });

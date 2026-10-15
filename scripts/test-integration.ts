@@ -58,7 +58,7 @@ async function test_fetch() {
   );
   for (const msg of messages) {
     assert(typeof msg.seqno === 'number', 'message has seqno');
-    assert(typeof msg.body === 'string', 'message has body');
+    assert(msg.body instanceof Uint8Array, 'message has body');
     assert(msg.body.length > 0, 'body is non-empty');
     assert(Array.isArray(msg.flags), 'message has flags array');
     console.log(

@@ -5,7 +5,11 @@ items; the session owns every write and every tag, queues commands, and holds
 IDLE as one of its states; the connection spells the IMAP operations in terms
 of the session.
 
-Tests: 75 passed, 2 todo (five files, ~4s).  `docs/untested.md` names what they
+Every size on this wire counts octets — a literal's `{n}` above all — so the
+transport frames bytes and decodes text only where text is meant: one complete
+line at a time.  A fetched body arrives as the octets the server sent.
+
+Tests: 83 passed, 2 todo (five files, ~4s).  `docs/untested.md` names what they
 do not cover.
 
 > As built 2026-10-14 from `docs/proposals/session-layers.md`.  The shape it
@@ -16,20 +20,22 @@ do not cover.
 
 ---
 
-## Layer 1 — Transport (`transport.ts`, 253 lines)
+## Layer 1 — Transport (`transport.ts`, 301 lines)
 
 **Responsibility:** turn a TCP/TLS stream into framed IMAP items.  The only
 layer that knows about `\r\n`, `{size}` literals, `+` continuations, and raw
 socket reads and writes.  No IMAP semantics — no tags, no OK/NO/BAD, no
-command meanings.
+command meanings.  Its arithmetic is octets: the frame buffer is bytes, a
+literal is sliced by bytes, and text comes only from a complete line.
 
 ### State
 
 - `#socket` — the connected socket (TCP or TLS), handed in by `connect.ts`.
-- `#buf`, `#literalRemaining`, `#literalChunks` — the framing buffers.
+- `#buf`, `#literalRemaining`, `#literalChunks` — the framing buffers, in bytes.
 - `#items: TransportItems | null` — the item stream, created on first read.
 - `#dead` — set on close or error.
-- `#onRawRead` — the debug seam: every raw read, when a caller wants it.
+- `#onRawRead` — the debug seam: every raw read, when a caller wants it, decoded
+  by a decoder that carries a character split between two chunks.
 
 ### Items
 
@@ -37,9 +43,13 @@ command meanings.
 type TransportItem =
   | { kind: 'line'; line: string }
   | { kind: 'continue'; line: string }
-  | { kind: 'literal'; data: string }
+  | { kind: 'literal'; data: Uint8Array }
   | { kind: 'ended'; error?: Error };
 ```
+
+A `line` and a `continue` are protocol text and arrive decoded.  A `literal`
+arrives as the octets themselves: a message body is bytes, its charset lives in
+its own headers, and turning it into text is a parser's job.
 
 `items()` returns an `AsyncIterable` the session loop reads.  `ended` is
 delivered as the last item, so a `for await` reader learns why it stopped
@@ -118,16 +128,17 @@ one that timed out, rather than reading as a socket that went away on its own.
 
 ---
 
-## Layer 3 — Collectors (`collectors.ts`, 77 lines)
+## Layer 3 — Collectors (`collectors.ts`, 82 lines)
 
 **Responsibility:** how one command's reply is read.  A collector is handed
 every item that arrives while its command is the oldest one outstanding, and
 the tagged OK asks it for the result.
 
 - `LinesCollector` — the reply as the lines it was; what most commands are.
-- `FetchCollector` — one message per FETCH line, its body from the literal that
-  follows it (or inline).  The FETCH parse used to live in `connection.ts` with
-  a `setImmediate` to guess that the tagged OK had been dispatched.
+- `FetchCollector` — one message per FETCH line, its body the octets of the
+  literal that follows it (or, inline, the octets of the text the line carried).
+  The FETCH parse used to live in `connection.ts` with a `setImmediate` to guess
+  that the tagged OK had been dispatched.
 
 ---
 
@@ -197,22 +208,22 @@ refuses LOGOUT still gets a closed connection.
 
 ```
 src/
-├── transport.ts     253  Layer 1 — socket, framing, the item stream
+├── transport.ts     301  Layer 1 — socket, framing, the item stream
 ├── session.ts       466  Layer 2 — the loop: queue, batches, IDLE, timeouts
-├── collectors.ts     77  Layer 3 — how a reply is read
+├── collectors.ts     82  Layer 3 — how a reply is read
 ├── connect.ts       187  Layer 4 — socket, TLS, LOGIN, CAPABILITY
-├── connection.ts    374  Layer 5 — the public operations
-├── watcher.ts       280  reconnect, catch-up, keepalive, the mail event
-├── interface.ts      55  types
+├── connection.ts    377  Layer 5 — the public operations
+├── watcher.ts       288  reconnect, catch-up, keepalive, the mail event
+├── interface.ts      68  types
 └── index.ts           8  exports
 test/
-├── transport.test.ts    4 cases
+├── transport.test.ts   11 cases
 ├── session.test.ts     11 cases
 ├── collectors.test.ts   4 cases
 ├── connection.test.ts  52 cases + 2 todo
-└── watcher.test.ts     13 cases
+└── watcher.test.ts      5 cases
 scripts/
-├── imap-server-mock.ts  391  the mock server the connection and watcher suites drive
+├── imap-server-mock.ts  405  the mock server the connection and watcher suites drive
 └── test-integration.ts  116  against a real server, outside the gate
 ```
 

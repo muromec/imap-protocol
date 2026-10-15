@@ -46,17 +46,18 @@ export interface WatcherEvent {
  *
  * Wraps the low-level IDLE loop with automatic reconnection on disconnect,
  * keepalive IDLE cycling to prevent server timeouts, and raw fetched
- * messages.  Parsing a message is the caller's business.  By default the
- * watcher also flags each message `\Seen`, after handing it over and never
- * before; `markSeen: false` leaves that decision to the caller, which flags
- * through {@link MailboxWatcher.connection}.
+ * messages: a body is the octets the server sent, and parsing it — charset and
+ * all — is the caller's business.  By default the watcher also flags each
+ * message `\Seen`, after handing it over and never before; `markSeen: false`
+ * leaves that decision to the caller, which flags through
+ * {@link MailboxWatcher.connection}.
  *
  * Usage:
  * ```ts
  * const watcher = new MailboxWatcher(config);
  * watcher.on('mail', (event) => {
  *   for (const msg of event.messages ?? []) {
- *     console.log(msg.body);
+ *     console.log(new TextDecoder().decode(msg.body));
  *   }
  * });
  * await watcher.start();

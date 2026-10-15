@@ -1,6 +1,10 @@
 import { Socket } from 'node:net';
+import { StringDecoder } from 'node:string_decoder';
 
 const CRLF = '\r\n';
+
+/** The line terminator as octets: the framing searches bytes, never characters. */
+const CRLF_BYTES = Buffer.from(CRLF);
 
 /**
  * Thin wrapper that intercepts outgoing writes for debug logging.
@@ -29,11 +33,15 @@ export function defaultDebugSink(line: string): void {
  *
  * The session loop reads it: a command's reply and the connection going
  * are steps a loop takes, not notifications it is handed.
+ *
+ * A line is protocol text and arrives decoded.  A literal arrives as the octets
+ * the server sent: a message body is bytes, its charset lives in its own headers,
+ * and only a parser that reads them can turn it into text.
  */
 export type TransportItem =
   | { kind: 'line'; line: string }
   | { kind: 'continue'; line: string }
-  | { kind: 'literal'; data: string }
+  | { kind: 'literal'; data: Uint8Array }
   | { kind: 'ended'; error?: Error };
 
 /**
@@ -96,12 +104,19 @@ export class TransportItems implements AsyncIterable<TransportItem> {
  * The Transport has no knowledge of IMAP semantics (tags, OK / NO / BAD,
  * mailbox state, etc.).  It only knows about CRLF-delimited lines,
  * `{size}` literal synchronisation, and `+` continuation lines.
+ *
+ * What it does know is that every size on this wire is a count of octets: the
+ * buffer it frames is bytes, the literal it hands over is bytes, and text is
+ * made only where text is meant — one complete line at a time.
  */
 export class Transport {
   readonly #socket: Socket;
-  #buf = '';
+  #buf: Buffer = Buffer.alloc(0);
   #literalRemaining = 0;
-  #literalChunks: string[] = [];
+  #literalChunks: Buffer[] = [];
+  /** Decodes the inbound text view for debug logging, holding a character that
+   *  was split between two chunks rather than replacing its halves. */
+  #rawText = new StringDecoder('utf8');
 
   #onRawRead: ((raw: string) => void) | null = null;
   #items: TransportItems | null = null;
@@ -128,9 +143,9 @@ export class Transport {
     if (debugEnabled) this.#hookWrites();
 
     socket.on('data', (chunk: Buffer) => {
-      const raw = chunk.toString('utf8');
-      this.#onRawRead?.(raw);
-      this.#onData(raw);
+      // The debug view is text; the framing below counts octets.
+      this.#onRawRead?.(this.#rawText.write(chunk));
+      this.#onData(chunk);
     });
 
     socket.on('close', () => this.#onSocketClose());
@@ -141,7 +156,10 @@ export class Transport {
     });
   }
 
-  /** Raw-read hook for debug logging — one callback, replaceable. */
+  /**
+   * Raw-read hook for debug logging — one callback, replaceable.  It is handed
+   * text, decoded with a decoder that carries a split character across chunks.
+   */
   onRawRead(cb: ((raw: string) => void) | null): void {
     this.#onRawRead = cb;
   }
@@ -206,8 +224,13 @@ export class Transport {
   }
 
   // ── line / literal framing ───────────────────────────────────────────────
-  #onData(raw: string): void {
-    this.#buf += raw;
+  //
+  // Everything here counts octets.  A literal's declared size is a byte count, so
+  // the buffer is bytes and a slice is taken by bytes; text is made only from a
+  // complete line, where a character cannot be cut in half.
+
+  #onData(chunk: Buffer): void {
+    this.#buf = this.#buf.length === 0 ? chunk : Buffer.concat([this.#buf, chunk]);
     this.#drain();
   }
 
@@ -216,27 +239,27 @@ export class Transport {
       if (this.#literalRemaining > 0) {
         if (this.#buf.length === 0) return;
         const take = Math.min(this.#literalRemaining, this.#buf.length);
-        this.#literalChunks.push(this.#buf.slice(0, take));
+        this.#literalChunks.push(this.#buf.subarray(0, take));
         this.#literalRemaining -= take;
-        this.#buf = this.#buf.slice(take);
+        this.#buf = this.#buf.subarray(take);
 
         if (this.#literalRemaining === 0) {
-          const data = this.#literalChunks.join('');
+          const data = Buffer.concat(this.#literalChunks);
           this.#literalChunks = [];
           this.#items?.push({ kind: 'literal', data });
-          if (this.#buf.startsWith(CRLF)) {
-            this.#buf = this.#buf.slice(2);
+          if (this.#buf.subarray(0, 2).equals(CRLF_BYTES)) {
+            this.#buf = this.#buf.subarray(2);
           }
           continue;
         }
         return;
       }
 
-      const idx = this.#buf.indexOf(CRLF);
+      const idx = this.#buf.indexOf(CRLF_BYTES);
       if (idx === -1) return;
 
-      const line = this.#buf.slice(0, idx);
-      this.#buf = this.#buf.slice(idx + 2);
+      const line = this.#buf.subarray(0, idx).toString('utf8');
+      this.#buf = this.#buf.subarray(idx + 2);
 
       if (!line) continue;
 

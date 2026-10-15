@@ -39,6 +39,9 @@ const RE_FETCH_START = /^\* (\d+) FETCH \((.*)/;
  * follows the line — or inline, when the server sent it that way.  The literal
  * that follows belongs to the FETCH line before it, which is why the pending
  * bodies are kept in order.
+ *
+ * A body is the octets the server sent, undecoded: they are the message, and
+ * only a parser that reads its headers knows what charset they are in.
  */
 export class FetchCollector implements Collector<FetchedMessage[]> {
   readonly #results: FetchedMessage[] = [];
@@ -67,8 +70,10 @@ export class FetchCollector implements Collector<FetchedMessage[]> {
       return;
     }
 
-    const body = rest.match(/BODY\[[^\]]*\] (.+)/)?.[1] ?? '';
-    this.#results.push({ uid, seqno, body, flags });
+    // An inline body arrives inside a line, which the transport decoded into
+    // text; encoding it back is exact for the octets a line can carry.
+    const inline = rest.match(/BODY\[[^\]]*\] (.+)/)?.[1] ?? '';
+    this.#results.push({ uid, seqno, body: Buffer.from(inline, 'utf8'), flags });
   }
 
   finish(): FetchedMessage[] {

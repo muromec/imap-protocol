@@ -80,6 +80,15 @@ async function take(
   return taken;
 }
 
+/** A literal from text, so an expectation can state one. */
+const literalOf = (text: string): TransportItem => ({ kind: 'literal', data: Buffer.from(text, 'utf8') });
+
+/** A literal's octets as text — the test's convenience, not the library's. */
+const bytes = (data: Uint8Array): string => Buffer.from(data).toString('utf8');
+
+/** The same octets as hex, for the cases that are about the bytes themselves. */
+const hex = (data: Uint8Array): string => Buffer.from(data).toString('hex');
+
 describe('Transport items', () => {
   it('hands over a line, a literal and a continuation in wire order', async () => {
     const { transport } = await connectTransport([
@@ -96,7 +105,7 @@ describe('Transport items', () => {
     transport.send('A2 NOOP');
     expect(await take(items, 4, 'the fetch response and the continuation')).toEqual([
       { kind: 'line', line: '* 1 FETCH (BODY[] {5}' },
-      { kind: 'literal', data: 'hello' },
+      literalOf('hello'),
       { kind: 'line', line: 'A1 OK done' },
       { kind: 'continue', line: '+ nothing to say' },
     ]);
@@ -131,7 +140,7 @@ describe('Transport items', () => {
   it('holds what arrives before a reader starts, and ends once', async () => {
     const stream = new TransportItems();
     stream.push({ kind: 'line', line: 'one' });
-    stream.push({ kind: 'literal', data: 'two' });
+    stream.push(literalOf('two'));
     stream.end(new Error('gone'));
     stream.push({ kind: 'line', line: 'after the end' }); // must be ignored
 
@@ -140,7 +149,7 @@ describe('Transport items', () => {
     expect(taken.length).toBe(3);
     expect(taken.slice(0, 2)).toEqual([
       { kind: 'line', line: 'one' },
-      { kind: 'literal', data: 'two' },
+      literalOf('two'),
     ]);
     expect(taken[2]?.kind).toBe('ended');
     expect(taken[2]?.kind === 'ended' && taken[2].error?.message).toBe('gone');
@@ -158,12 +167,6 @@ describe('Transport items', () => {
 // client that counts characters reads past the body and frames what follows it
 // wrongly.  A character split between two TCP chunks is the same mistake at a
 // smaller scale.
-
-/** A literal's octets as text — the test's convenience, not the library's. */
-const bytes = (data: Uint8Array): string => Buffer.from(data).toString('utf8');
-
-/** The same octets as hex, for the cases that are about the bytes themselves. */
-const hex = (data: Uint8Array): string => Buffer.from(data).toString('hex');
 
 /** A transport over a socket nobody connects: the test writes the chunks, which
  *  is the only way to break one exactly where it hurts — inside a character. */

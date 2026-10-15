@@ -50,7 +50,12 @@ export interface MailboxInfo {
 export interface FetchedMessage {
   uid: number;
   seqno: number;
-  body: string;
+  /**
+   * The message as the server sent it: the literal's octets, undecoded.  Its
+   * charset lives in its own headers, so turning this into text is a parser's
+   * job, not the transport's.
+   */
+  body: Uint8Array;
   flags: string[];
 }
 

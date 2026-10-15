@@ -240,12 +240,20 @@ export class MockImapServer {
         !prev.includes('SEARCH');
 
       if (isLiteral) {
-        // Raw literal data — the reader consumes exactly {size} bytes,
-        // then expects a trailing CRLF.
-        this.#sendRaw(lines[i] + CRLF);
-      } else {
-        this.#sendRaw(lines[i] + CRLF);
+        // Raw literal data — the reader consumes exactly {size} octets, then a
+        // CRLF.  A scenario whose declared size does not match the bytes it
+        // sends would make this double agree with a broken client, so it is
+        // refused rather than written.
+        const declared = Number(prev?.match(/\{(\d+)\}$/)?.[1] ?? 0);
+        const octets = Buffer.byteLength(lines[i], 'utf8');
+        if (octets !== declared) {
+          const reason = `scenario says {${declared}} and sends ${octets} octets: ${JSON.stringify(lines[i])}`;
+          this.#rejectScenario?.(new Error(reason));
+          this.#socket?.destroy(new Error(reason));
+          return;
+        }
       }
+      this.#sendRaw(lines[i] + CRLF);
     }
   }
 

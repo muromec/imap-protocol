@@ -149,14 +149,16 @@ independently).
 ## 10. Fetch with inline body (no literal)
 
 **What is untested.**  Short message bodies may be returned inline (without
-`{size}` literal syntax) as `BODY[] {data}` directly in the fetch line.
-The `#handleFetchLine` code has an `else` branch for this, but no test
-covers it.
+`{size}` literal syntax) as `BODY[] {data}` directly in the fetch line.  The
+collector's inline branch has a unit case (`collectors.test.ts`), but no
+end-to-end fetch drives it.
 
 **Risk.**  **Low.**  Modern servers use literals for all but the smallest
 bodies.  If an inline body is returned, it is parsed via a regex that
 captures everything after `BODY[...] ` — which may include trailing
-parentheses from later fetch attributes.
+parentheses from later fetch attributes.  The line it rides in was decoded
+from octets as UTF-8, so an inline body is re-encoded to the octets a line
+can carry.
 
 ---
 

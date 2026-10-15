@@ -8,10 +8,20 @@ import { describe, expect, it } from 'vitest';
 
 import { FetchCollector } from '../src/collectors.ts';
 import type { TransportItem } from '../src/transport.ts';
+import type { FetchedMessage } from '../src/interface.ts';
 
 const line = (l: string): TransportItem => ({ kind: 'line', line: l });
-const literal = (data: string): TransportItem => ({ kind: 'literal', data });
+const literal = (text: string): TransportItem => ({ kind: 'literal', data: Buffer.from(text, 'utf8') });
 const cont = (l: string): TransportItem => ({ kind: 'continue', line: l });
+
+/** A fetched body is the octets the server sent; the test reads them as text. */
+const bytes = (data: Uint8Array): string => Buffer.from(data).toString('utf8');
+
+/** The same messages with their bodies read as text, so a case can state one. */
+const plain = (
+  msgs: FetchedMessage[],
+): Array<{ uid: number; seqno: number; body: string; flags: string[] }> =>
+  msgs.map((m) => ({ uid: m.uid, seqno: m.seqno, body: bytes(m.body), flags: m.flags }));
 
 describe('FetchCollector', () => {
   it('takes the body from the literal that follows its FETCH line', () => {
@@ -20,7 +30,7 @@ describe('FetchCollector', () => {
       collector.accept(item);
     }
 
-    expect(collector.finish()).toEqual([{ uid: 42, seqno: 1, body: 'hello', flags: ['\\Seen'] }]);
+    expect(plain(collector.finish())).toEqual([{ uid: 42, seqno: 1, body: 'hello', flags: ['\\Seen'] }]);
   });
 
   it('takes the rest of the line after the part marker as an inline body', () => {
@@ -29,7 +39,7 @@ describe('FetchCollector', () => {
     // and what servers actually send a body in is the literal above.
     collector.accept(line('* 7 FETCH (UID 9 FLAGS () BODY[] "short text")'));
 
-    expect(collector.finish()).toEqual([
+    expect(plain(collector.finish())).toEqual([
       { uid: 9, seqno: 7, body: '"short text")', flags: [] },
     ]);
   });
@@ -45,7 +55,7 @@ describe('FetchCollector', () => {
       collector.accept(item);
     }
 
-    expect(collector.finish().map((m) => [m.uid, m.body])).toEqual([
+    expect(plain(collector.finish()).map((m) => [m.uid, m.body])).toEqual([
       [42, 'one'],
       [43, 'two'],
     ]);
