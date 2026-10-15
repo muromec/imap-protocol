@@ -152,6 +152,86 @@ describe('Transport items', () => {
   });
 });
 
+// ── framing counts octets ───────────────────────────────────────────────────
+//
+// IMAP declares a literal's size in octets, and a message body is bytes: a
+// client that counts characters reads past the body and frames what follows it
+// wrongly.  A character split between two TCP chunks is the same mistake at a
+// smaller scale.
+
+/** A literal's octets as text — the test's convenience, not the library's. */
+const bytes = (data: Uint8Array): string => Buffer.from(data).toString('utf8');
+
+/** The same octets as hex, for the cases that are about the bytes themselves. */
+const hex = (data: Uint8Array): string => Buffer.from(data).toString('hex');
+
+/** A transport over a socket nobody connects: the test writes the chunks, which
+ *  is the only way to break one exactly where it hurts — inside a character. */
+function chunkedTransport(): {
+  transport: Transport;
+  feed: (...chunks: Array<string | Uint8Array>) => void;
+} {
+  const socket = new Socket();
+  sockets.push(socket);
+  const transport = new Transport(socket, false);
+  const feed = (...chunks: Array<string | Uint8Array>): void => {
+    for (const chunk of chunks) {
+      socket.emit('data', typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk));
+    }
+  };
+  return { transport, feed };
+}
+
+describe('framing counts octets', () => {
+  it("takes a literal's declared size as octets, so the line after it frames", async () => {
+    // 'héllo' is five characters and six octets: the server says {6}.
+    const { transport } = await connectTransport([
+      { expect: /^A1 FETCH /, respond: ['* 1 FETCH (BODY[] {6}', 'héllo'] },
+    ]);
+    const items = transport.items()[Symbol.asyncIterator]();
+    await take(items, 1, 'the greeting');
+
+    transport.send('A1 FETCH 1 BODY[]');
+
+    const [fetch, literal, reply] = await take(items, 3, 'the fetched line, its literal and the reply');
+    expect(fetch).toEqual({ kind: 'line', line: '* 1 FETCH (BODY[] {6}' });
+    if (literal?.kind !== 'literal') throw new Error(`expected a literal, got ${String(literal?.kind)}`);
+    expect(literal.data).toBeInstanceOf(Uint8Array);
+    expect(literal.data.length).toBe(6);
+    expect(bytes(literal.data)).toBe('héllo');
+    // the CRLF ends the fetched line: it is not part of the body
+    expect(reply).toEqual({ kind: 'line', line: 'A1 OK done' });
+  });
+
+  it('keeps a character whole when the socket breaks it across chunks', async () => {
+    const { transport, feed } = chunkedTransport();
+    const items = transport.items()[Symbol.asyncIterator]();
+
+    feed('* 1 FETCH (BODY[] {2}\r\n');
+    feed(Uint8Array.from([0xc3])); // the first half of 'é'
+    feed(Uint8Array.from([0xa9]), '\r\nA1 OK done\r\n');
+
+    const [fetch, literal, reply] = await take(items, 3, 'the fetched line, its literal and the reply');
+    expect(fetch).toEqual({ kind: 'line', line: '* 1 FETCH (BODY[] {2}' });
+    if (literal?.kind !== 'literal') throw new Error(`expected a literal, got ${String(literal?.kind)}`);
+    expect(hex(literal.data)).toBe('c3a9');
+    expect(reply).toEqual({ kind: 'line', line: 'A1 OK done' });
+  });
+
+  it('keeps a character whole when a line is broken across chunks', async () => {
+    const { transport, feed } = chunkedTransport();
+    const items = transport.items()[Symbol.asyncIterator]();
+
+    feed('* OK caf');
+    feed(Uint8Array.from([0xc3]));
+    feed(Uint8Array.from([0xa9]), ' ready\r\n');
+
+    expect(await take(items, 1, 'the untagged line')).toEqual([
+      { kind: 'line', line: '* OK café ready' },
+    ]);
+  });
+});
+
 // ── debug logging, switched at runtime ──────────────────────────────────────
 //
 // The outgoing side is a wrapper around `socket.write`, so a caller who turns
