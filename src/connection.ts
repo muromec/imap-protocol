@@ -1,4 +1,4 @@
-import { Transport } from './transport.ts';
+import { Transport, defaultDebugSink } from './transport.ts';
 import { Session } from './session.ts';
 import { connect } from './connect.ts';
 import { FetchCollector } from './collectors.ts';
@@ -33,10 +33,12 @@ export class Connection {
   #transport: Transport | null = null;
   #session: Session | null = null;
   #debugEnabled: boolean;
+  #debugSink: (line: string) => void;
 
   constructor(config: ImapConfig) {
     this.#config = config;
     this.#debugEnabled = config.debug ?? false;
+    this.#debugSink = config.debugSink ?? defaultDebugSink;
   }
 
   #mailboxInfo: MailboxInfo | null = null;
@@ -62,7 +64,8 @@ export class Connection {
   #debug(kind: string, ...args: unknown[]): void {
     if (this.#debugEnabled) {
       const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-      console.error(`[${ts}] [imap] ${kind}`, ...args);
+      const rest = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+      this.#debugSink(rest.length > 0 ? `[${ts}] [imap] ${kind} ${rest}` : `[${ts}] [imap] ${kind}`);
     }
   }
 

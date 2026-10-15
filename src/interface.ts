@@ -28,6 +28,14 @@ export interface ImapConfig {
    * Can be toggled at runtime via conn.setDebug(bool).
    */
   debug?: boolean;
+
+  /**
+   * Where debug lines go.  Default `console.error`, which a caller holding
+   * several connections cannot use: one process cannot tell whose line is
+   * whose.  Pass a sink and the lines arrive here instead.  `debug` (or
+   * `setDebug(true)`) still decides whether lines exist at all.
+   */
+  debugSink?: (line: string) => void;
 }
 
 export interface MailboxInfo {

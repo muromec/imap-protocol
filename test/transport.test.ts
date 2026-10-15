@@ -25,6 +25,7 @@ afterAll(() => {
 async function connectTransport(
   steps: ScenarioStep[] = [],
   greeting = '* OK mock IMAP server ready',
+  sink?: (line: string) => void,
 ): Promise<{ server: MockImapServer; socket: Socket; transport: Transport }> {
   const server = new MockImapServer();
   servers.push(server);
@@ -33,7 +34,7 @@ async function connectTransport(
 
   const socket = new Socket();
   sockets.push(socket);
-  const transport = new Transport(socket);
+  const transport = new Transport(socket, false, sink);
   await new Promise<void>((resolve, reject) => {
     const onError = (e: Error) => reject(e);
     socket.once('error', onError);
@@ -195,5 +196,50 @@ describe('debug logging switched at runtime', () => {
     });
     expect(afterOff.some((line) => line.includes('A002'))).toBe(true);
     expect(afterOff.some((line) => line.includes('A003'))).toBe(false);
+  });
+});
+
+// ── where debug lines go ────────────────────────────────────────────────────
+//
+// One process can hold several connections, and the console cannot say whose line
+// is whose: a caller that wants them apart passes `debugSink`.
+
+describe('debug lines and the sink', () => {
+  it('hands a line to the sink and leaves the console alone', async () => {
+    const lines: string[] = [];
+    const { transport } = await connectTransport([], '* OK mock IMAP server ready', (line) =>
+      lines.push(line),
+    );
+    const consoleLines: unknown[][] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      consoleLines.push(args);
+    });
+
+    try {
+      transport.setDebug(true);
+      transport.send('A001 NOOP');
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(lines.some((line) => line.includes('→') && line.includes('A001 NOOP'))).toBe(true);
+    expect(consoleLines).toEqual([]);
+  });
+
+  it('falls back to the console when no sink was named', async () => {
+    const { transport } = await connectTransport();
+    const consoleLines: unknown[][] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      consoleLines.push(args);
+    });
+
+    try {
+      transport.setDebug(true);
+      transport.send('A002 NOOP');
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(consoleLines.some((call) => String(call[0]).includes('A002 NOOP'))).toBe(true);
   });
 });

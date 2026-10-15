@@ -20,7 +20,7 @@ export async function connect(
   debugEnabled: boolean,
 ): Promise<{ transport: Transport; session: Session; capabilities: Set<string> }> {
   const socket = await createSocket(config);
-  let transport = new Transport(socket, debugEnabled);
+  let transport = new Transport(socket, debugEnabled, config.debugSink);
   let session = new Session(transport, { commandTimeout: config.commandTimeout ?? 30_000 });
 
   const greeting = await waitForGreeting(session, config);
@@ -136,7 +136,7 @@ async function starttls(
     ...config.tlsOptions,
   });
 
-  const newTransport = new Transport(tlsSocket, debugEnabled);
+  const newTransport = new Transport(tlsSocket, debugEnabled, config.debugSink);
   const newSession = new Session(newTransport, { commandTimeout: config.commandTimeout ?? 30_000 });
 
   return { transport: newTransport, session: newSession };

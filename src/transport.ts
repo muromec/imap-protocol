@@ -14,6 +14,14 @@ function debugSocket(socket: Socket, onWrite: (raw: string) => void): Socket {
   return socket;
 }
 
+/**
+ * Where a debug line goes when the caller named nowhere: the console, which is
+ * what this library has always done and what a one-connection process wants.
+ */
+export function defaultDebugSink(line: string): void {
+  console.error(line);
+}
+
 // ── items ─────────────────────────────────────────────────────────────────
 
 /**
@@ -99,6 +107,7 @@ export class Transport {
   #items: TransportItems | null = null;
 
   #debugEnabled: boolean;
+  #debugSink: (line: string) => void;
   #dead = false;
   #writeHooked = false;
 
@@ -110,9 +119,11 @@ export class Transport {
    *
    * @param socket       The connected TCP/TLS socket.
    * @param debugEnabled Initial debug-logging state.
+   * @param sink       Where debug lines go.  Default: the console.
    */
-  constructor(socket: Socket, debugEnabled = false) {
+  constructor(socket: Socket, debugEnabled = false, sink: (line: string) => void = defaultDebugSink) {
     this.#debugEnabled = debugEnabled;
+    this.#debugSink = sink;
     this.#socket = socket;
     if (debugEnabled) this.#hookWrites();
 
@@ -184,7 +195,7 @@ export class Transport {
   #debugLog(kind: string, raw: string): void {
     if (this.#debugEnabled) {
       const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-      console.error(`[${ts}] [imap] ${kind} ${JSON.stringify(raw)}`);
+      this.#debugSink(`[${ts}] [imap] ${kind} ${JSON.stringify(raw)}`);
     }
   }
 

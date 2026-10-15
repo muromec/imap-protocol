@@ -28,6 +28,9 @@ export interface WatcherConfig {
 
   /** Enable protocol-level debug logging on underlying connections. */
   debug?: boolean;
+
+  /** Where debug lines go; default the console.  See `ImapConfig.debugSink`. */
+  debugSink?: (line: string) => void;
 }
 
 export interface WatcherEvent {
@@ -93,6 +96,7 @@ export class MailboxWatcher extends EventTarget {
           port: this.#config.port,
           tls: this.#config.tls ?? true,
           debug: this.#config.debug,
+          debugSink: this.#config.debugSink,
         });
 
         await conn.connect();
